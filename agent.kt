@@ -1,7 +1,16 @@
 ///usr/bin/env jbang "$0" "$@" ; exit $?
 //KOTLIN 2.4.10
-//DEPS org.jetbrains.kotlin:kotlin-stdlib:2.0.21
+//DEPS org.jetbrains.kotlin:kotlin-stdlib:2.4.10
+//DEPS org.jetbrains.kotlinx:kotlinx-serialization-json:1.7.3
 
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.jsonArray
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import java.io.BufferedReader
 import java.io.File
 import java.io.InputStreamReader
@@ -24,12 +33,7 @@ data class AgentResponse(
 class BashTool(private val workspace: File) {
     fun execute(command: String): String {
         return try {
-            val isWindows = System.getProperty("os.name").lowercase().contains("win")
-            val processBuilder = if (isWindows) {
-                ProcessBuilder("cmd.exe", "/c", command)
-            } else {
-                ProcessBuilder("bash", "-c", command)
-            }
+            val processBuilder = ProcessBuilder("bash", "-c", command)
 
             processBuilder.directory(workspace)
             val process = processBuilder.start()
@@ -41,10 +45,10 @@ class BashTool(private val workspace: File) {
             buildString {
                 if (output.isNotBlank()) append(output)
                 if (error.isNotBlank()) append("ERROR OUTPUT:\n").append(error)
-                append("\n[Exit Code: \$exitCode]")
+                append("\n[Exit Code: $exitCode]")
             }
         } catch (e: Exception) {
-            "Execution Error: \${e.message}"
+            "Execution Error: ${e.message}"
         }
     }
 }
@@ -63,7 +67,7 @@ class BashAgentHarness(private val workspace: File, private val apiKey: String) 
     init {
         val systemPrompt = """
             You are an autonomous coding agent with full access to a local bash shell.
-            Your working directory is: \${workspace.absolutePath}
+            Your working directory is: ${workspace.absolutePath}
             
             You must respond ONLY with a raw, valid JSON object matching this schema. 
             Do not wrap it in markdown formatting (like ```json). Escape strings properly.
@@ -115,25 +119,26 @@ class BashAgentHarness(private val workspace: File, private val apiKey: String) 
 // ==========================================
 
 fun callOpenAI(client: HttpClient, messages: List<Pair<String, String>>, apiKey: String): String {
-    // Manuelles Escaping und JSON-Payload Generierung
-    val messagesJson = messages.joinToString(",") { (role, content) ->
-        val escapedContent = content
-            .replace("\\", "\\\\")
-            .replace("\"", "\\\"")
-            .replace("\n", "\\n")
-            .replace("\r", "\\r")
-        """{"role": "$role", "content": "$escapedContent"}"""
-    }
-
-    val payload = """{
-        "model": "gpt-4o-mini",
-        "messages": [$messagesJson],
-        "temperature": 0.1,
-        "response_format": { "type": "json_object" }
-    }"""
+    val payload = JsonObject(
+        mapOf(
+            "model" to JsonPrimitive("gpt-4o-mini"),
+            "messages" to JsonArray(
+                messages.map { (role, content) ->
+                    JsonObject(
+                        mapOf(
+                            "role" to JsonPrimitive(role),
+                            "content" to JsonPrimitive(content)
+                        )
+                    )
+                }
+            ),
+            "temperature" to JsonPrimitive(0.1),
+            "response_format" to JsonObject(mapOf("type" to JsonPrimitive("json_object")))
+        )
+    ).toString()
 
     val request = HttpRequest.newBuilder()
-        .uri(URI.create("https://openai.com"))
+        .uri(URI.create("https://api.openai.com/v1/chat/completions"))
         .timeout(Duration.ofSeconds(30))
         .header("Authorization", "Bearer $apiKey")
         .header("Content-Type", "application/json")
@@ -146,21 +151,23 @@ fun callOpenAI(client: HttpClient, messages: List<Pair<String, String>>, apiKey:
         throw Exception("API Error [Status ${response.statusCode()}]: ${response.body()}")
     }
 
-    // Extrahiert den "content"-String sauber aus dem flachen OpenAI Chat-JSON Response
-    val contentRegex = """"content":\s*"(.*?)"\s*(?=\s*\}\s*,\s*"logprobs")""".toRegex(RegexOption.DOT_MATCHES_ALL)
-    val match = contentRegex.find(response.body()) ?: return response.body()
-
-    return match.groups[1]!!.value
-        .replace("\\\"", "\"")
-        .replace("\\n", "\n")
-        .replace("\\\\", "\\")
+    val body = Json.parseToJsonElement(response.body()).jsonObject
+    return body["choices"]
+        ?.jsonArray
+        ?.firstOrNull()
+        ?.jsonObject
+        ?.get("message")
+        ?.jsonObject
+        ?.get("content")
+        ?.jsonPrimitive
+        ?.contentOrNull
+        ?: throw Exception("API response did not contain choices[0].message.content: ${response.body()}")
 }
 
 fun parseJson(rawJson: String): AgentResponse {
-    fun extract(key: String): String? {
-        val regex = """"$key"\s*:\s*"(.*?)"""".toRegex(RegexOption.DOT_MATCHES_ALL)
-        return regex.find(rawJson)?.groups?.get(1)?.value
-    }
+    val json = Json.parseToJsonElement(rawJson).jsonObject
+    fun extract(key: String): String? = json[key]?.jsonPrimitive?.contentOrNull
+
     return AgentResponse(
         reasoning = extract("reasoning") ?: "Thinking...",
         bashCommand = extract("bashCommand"),
