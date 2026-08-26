@@ -19,6 +19,7 @@ import java.net.http.HttpClient
 import java.net.http.HttpRequest
 import java.net.http.HttpResponse
 import java.time.Duration
+import kotlin.concurrent.thread
 
 // ==========================================
 // 1. STRUCTURES & BASH EXECUTION
@@ -41,8 +42,12 @@ class BashTool(private val workspace: File) {
             processBuilder.redirectInput(ProcessBuilder.Redirect.from(File("/dev/null")))
             val process = processBuilder.start()
 
+            // Drain stderr on its own thread: reading the two streams one after
+            // the other deadlocks as soon as the unread one fills its pipe buffer.
+            var error = ""
+            val errorDrain = thread { error = BufferedReader(InputStreamReader(process.errorStream)).readText() }
             val output = BufferedReader(InputStreamReader(process.inputStream)).readText()
-            val error = BufferedReader(InputStreamReader(process.errorStream)).readText()
+            errorDrain.join()
             val exitCode = process.waitFor()
 
             buildString {
