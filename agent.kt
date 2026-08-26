@@ -33,6 +33,12 @@ const val MAX_JOB_LOG_CHARS = 40_000   // held in memory per background job stre
 const val DEFAULT_WAIT_SECONDS = 60L
 const val MAX_WAIT_SECONDS = 600L
 
+// Sub-agents are this same program in one-shot mode, started as background jobs. Every job
+// inherits AGENT_DEPTH + 1, and the prompt stops offering the pattern at the cap, so a chain
+// of children cannot fork without bound.
+const val MAX_AGENT_DEPTH = 2
+val AGENT_DEPTH = System.getenv("AGENT_DEPTH")?.toIntOrNull() ?: 0
+
 // Sized against tokens-per-minute, not the context window: the whole history is
 // resent every iteration and cached tokens still count against TPM.
 const val MAX_OUTPUT_CHARS = 6000
@@ -43,6 +49,19 @@ const val MAX_RETRIES = 5
 const val MAX_RETRY_WAIT_MS = 60_000L
 
 // ---------- 1. Command execution ----------
+
+/**
+ * How to launch this very program again, for sub-agents. AGENT_CMD wins; otherwise it is rebuilt
+ * from our own argv, which works for both the JBang script and the Gradle-installed launcher.
+ * Null when neither is known, in which case the model is simply not offered sub-agents.
+ */
+fun selfCommand(): String? {
+    System.getenv("AGENT_CMD")?.takeIf { it.isNotBlank() }?.let { return it }
+    val info = ProcessHandle.current().info()
+    val command = info.command().orElse(null) ?: return null
+    val args = info.arguments().orElse(null) ?: return null
+    return (listOf(command) + args).joinToString(" ") { "'" + it.replace("'", "'\\''") + "'" }
+}
 
 /** Caps output, keeping head and tail: build failures land at the end. */
 fun truncate(text: String): String {
@@ -165,7 +184,8 @@ class BackgroundJob(
 /** Runs every command; only background jobs are registered by name. Finished jobs stay findable. */
 class JobRegistry(
     private val workspace: File,
-    private val onFinished: (BackgroundJob) -> Unit = {}
+    private val depth: Int = AGENT_DEPTH,
+    private val onFinished: (BackgroundJob) -> Unit = {} // last, so callers can pass a trailing lambda
 ) {
     private val jobs = LinkedHashMap<String, BackgroundJob>()
     private var counter = 0
@@ -174,6 +194,7 @@ class JobRegistry(
     private fun launch(command: String) = ProcessBuilder("bash", "-c", command)
         .directory(workspace)
         .redirectInput(ProcessBuilder.Redirect.from(File("/dev/null"))) // no stdin: never block on input
+        .apply { environment()["AGENT_DEPTH"] = (depth + 1).toString() } // see MAX_AGENT_DEPTH
         .start()
 
     /** Starts [command] detached. Throws only if it will not launch. */
@@ -299,9 +320,11 @@ class BashAgentHarness(
     private val apiKey: String,
     private val baseUrl: String = API_BASE,          // tests point this at a mock
     private val timeoutSeconds: Long = TIMEOUT_SECONDS,
+    depth: Int = AGENT_DEPTH,                         // tests pin it; real runs read the environment
+    subAgentCommand: String? = selfCommand(),
     onJobFinished: (BackgroundJob) -> Unit = {}       // rung from a job's watcher thread
 ) {
-    private val jobs = JobRegistry(workspace, onJobFinished)
+    private val jobs = JobRegistry(workspace, depth, onJobFinished)
     private val input = mutableListOf<JsonObject>()
     private val httpClient = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10)).build()
 
@@ -328,9 +351,21 @@ class BashAgentHarness(
         user turn is preceded by a [background jobs still running] listing. Use "wait" only when you need the
         result to answer. A finished job may hand you a turn without user input: report it and stop; fix it only
         if it failed. Background jobs survive an interrupted task and die with the session.
-    """.trimIndent()
+    """.trimIndent() + subAgentPrompt(depth, subAgentCommand)
 
     init { reset() }
+
+    /** Empty at the depth cap, so a child at the bottom of the chain is never shown the idea. */
+    private fun subAgentPrompt(depth: Int, command: String?): String {
+        if (command == null || depth >= MAX_AGENT_DEPTH) return ""
+        return "\n\n" + """
+            Sub-agents: for an independent, self-contained subtask, start a copy of yourself as a background job.
+            It has no memory of this conversation, so put everything it needs in the prompt. Its answer is
+            delivered when it finishes; redirect stderr or its progress log will crowd the answer out:
+              {"action":"start","command":"echo 'Count the lines in every .kt file and report the total' | $command 2>/dev/null","name":"count"}
+            Run several in parallel only on disjoint files: they share this working directory.
+        """.trimIndent()
+    }
 
     fun reset() {
         input.clear()
@@ -677,6 +712,10 @@ fun main() {
     val apiKey = System.getenv("OPENAI_API_KEY").orEmpty()
     if (apiKey.isBlank()) {
         System.err.println("❌ Please set the 'OPENAI_API_KEY' environment variable.")
+        exitProcess(2)
+    }
+    if (AGENT_DEPTH > MAX_AGENT_DEPTH) {
+        System.err.println("❌ AGENT_DEPTH=$AGENT_DEPTH exceeds MAX_AGENT_DEPTH=$MAX_AGENT_DEPTH; refusing to nest deeper.")
         exitProcess(2)
     }
     val workspace = File(".").apply { mkdirs() }.canonicalFile
