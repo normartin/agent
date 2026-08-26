@@ -37,8 +37,17 @@ const val OUTPUT_USD_PER_1M = 10.00
 
 const val MAX_ITERATIONS = 15
 const val TIMEOUT_SECONDS = 120L
-const val MAX_OUTPUT_CHARS = 6000
-const val MAX_HISTORY_CHARS = 200_000
+
+// Every iteration resends the whole history, so tokens per minute grow with the
+// square of the turn count. Both budgets below are sized against a tokens-per-
+// minute limit, not against the model's context window: at roughly 4 chars per
+// token a full history is ~15k tokens, about half a 30k TPM allowance. Raise
+// them if your account's TPM limit goes up — the agent forgets less that way.
+const val MAX_OUTPUT_CHARS = 2500
+const val MAX_HISTORY_CHARS = 60_000
+
+const val MAX_RETRIES = 5
+const val MAX_RETRY_WAIT_MS = 60_000L
 
 // ==========================================
 // 1. BASH EXECUTION
@@ -115,8 +124,9 @@ class BashTool(private val workspace: File) {
  */
 fun truncate(text: String): String {
     if (text.length <= MAX_OUTPUT_CHARS) return text
-    val head = text.take(4000)
-    val tail = text.takeLast(2000)
+    // Derived from the cap so the two can never add up to more than it allows.
+    val head = text.take(MAX_OUTPUT_CHARS * 2 / 3)
+    val tail = text.takeLast(MAX_OUTPUT_CHARS / 3)
     return "$head\n… [${text.length - head.length - tail.length} chars elided] …\n$tail"
 }
 
@@ -220,9 +230,10 @@ class BashAgentHarness(private val workspace: File, private val apiKey: String) 
                 trimHistory(messages)
 
                 val turn = try {
-                    callOpenAI(httpClient, messages, apiKey)
+                    callOpenAI(httpClient, messages, apiKey) { interrupted }
                 } catch (e: Exception) {
-                    println("❌ API Error: ${e.message}")
+                    if (interrupted) println("\n⏹️ Interrupted. Ask again to continue.")
+                    else println("❌ API Error: ${e.message}")
                     return
                 }
 
@@ -313,7 +324,65 @@ class BashAgentHarness(private val workspace: File, private val apiKey: String) 
 // 3. MODERN HTTP & PRIMITIVE JSON UTILS
 // ==========================================
 
-fun callOpenAI(client: HttpClient, messages: List<JsonObject>, apiKey: String): Turn {
+/**
+ * Reads the duration formats OpenAI uses in its rate-limit headers: "8.134s",
+ * "1m30s", "500ms", or a bare number of seconds. Returns null if it is none of
+ * those, so the caller can fall back to its own backoff.
+ */
+fun parseDelayMs(raw: String?): Long? {
+    val text = raw?.trim().orEmpty()
+    if (text.isEmpty()) return null
+    text.toDoubleOrNull()?.let { return (it * 1000).toLong() }
+
+    // "ms" has to be tried before "s", or "500ms" reads as 500 seconds.
+    val parts = Regex("([0-9]*\\.?[0-9]+)(ms|s|m|h)").findAll(text).toList()
+    if (parts.isEmpty()) return null
+    return parts.sumOf { part ->
+        val amount = part.groupValues[1].toDouble()
+        when (part.groupValues[2]) {
+            "ms" -> amount
+            "s" -> amount * 1_000
+            "m" -> amount * 60_000
+            else -> amount * 3_600_000
+        }.toLong()
+    }
+}
+
+/**
+ * How long to wait before retrying. The server tells us exactly when the window
+ * reopens, so prefer its answer and only fall back to exponential backoff.
+ */
+fun retryDelayMs(response: HttpResponse<String>, attempt: Int): Long {
+    fun header(name: String) = response.headers().firstValue(name).orElse(null)
+
+    val hinted = header("retry-after-ms")?.trim()?.toDoubleOrNull()?.toLong()
+        ?: parseDelayMs(header("retry-after"))
+        ?: parseDelayMs(header("x-ratelimit-reset-tokens"))
+        ?: parseDelayMs(header("x-ratelimit-reset-requests"))
+
+    // A little past the stated reset: the window boundary is exact, and landing
+    // on it earns a second 429.
+    val delay = hinted?.plus(250) ?: (1000L shl attempt)
+    return delay.coerceIn(250, MAX_RETRY_WAIT_MS)
+}
+
+/** Sleeps in slices so Ctrl+C is felt during a long rate-limit wait. */
+fun sleepUnlessCancelled(totalMs: Long, cancelled: () -> Boolean): Boolean {
+    val deadline = System.currentTimeMillis() + totalMs
+    while (true) {
+        if (cancelled()) return false
+        val left = deadline - System.currentTimeMillis()
+        if (left <= 0) return true
+        Thread.sleep(minOf(200L, left))
+    }
+}
+
+fun callOpenAI(
+    client: HttpClient,
+    messages: List<JsonObject>,
+    apiKey: String,
+    cancelled: () -> Boolean = { false }
+): Turn {
     val payload = buildJsonObject {
         put("model", MODEL)
         put("messages", JsonArray(messages))
@@ -347,7 +416,24 @@ fun callOpenAI(client: HttpClient, messages: List<JsonObject>, apiKey: String): 
         .POST(HttpRequest.BodyPublishers.ofString(payload))
         .build()
 
-    val response = client.send(request, HttpResponse.BodyHandlers.ofString())
+    // A rate limit is the normal weather for an agent loop, not an error: the
+    // loop resends its whole history every iteration, so a busy task can spend a
+    // minute's token allowance on itself. Wait it out rather than lose the task.
+    var attempt = 0
+    var response = client.send(request, HttpResponse.BodyHandlers.ofString())
+    while (response.statusCode() == 429 || response.statusCode() >= 500) {
+        if (attempt >= MAX_RETRIES) {
+            throw Exception("API Error [Status ${response.statusCode()}] after $MAX_RETRIES retries: ${response.body()}")
+        }
+        val waitMs = retryDelayMs(response, attempt)
+        attempt++
+        println(
+            "⏳ %d from the API — retrying in %.1fs (attempt %d/%d)"
+                .format(Locale.ROOT, response.statusCode(), waitMs / 1000.0, attempt, MAX_RETRIES)
+        )
+        if (!sleepUnlessCancelled(waitMs, cancelled)) throw Exception("Cancelled while waiting out a rate limit.")
+        response = client.send(request, HttpResponse.BodyHandlers.ofString())
+    }
 
     if (response.statusCode() != 200) {
         throw Exception("API Error [Status ${response.statusCode()}]: ${response.body()}")
