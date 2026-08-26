@@ -29,22 +29,26 @@ import java.util.concurrent.TimeUnit
 import kotlin.concurrent.thread
 import kotlin.system.exitProcess
 
-const val MODEL = "gpt-4o"
+const val MODEL = "gpt-5"
 
 // USD per 1M tokens for MODEL. These move with the model — change them together.
-const val INPUT_USD_PER_1M = 2.50
+// Cached input is an order of magnitude cheaper, and this loop resends the same
+// growing prefix on every iteration, so it is worth pricing separately.
+const val INPUT_USD_PER_1M = 1.25
+const val CACHED_INPUT_USD_PER_1M = 0.125
 const val OUTPUT_USD_PER_1M = 10.00
 
 const val MAX_ITERATIONS = 15
 const val TIMEOUT_SECONDS = 120L
 
 // Every iteration resends the whole history, so tokens per minute grow with the
-// square of the turn count. Both budgets below are sized against a tokens-per-
-// minute limit, not against the model's context window: at roughly 4 chars per
-// token a full history is ~15k tokens, about half a 30k TPM allowance. Raise
-// them if your account's TPM limit goes up — the agent forgets less that way.
-const val MAX_OUTPUT_CHARS = 2500
-const val MAX_HISTORY_CHARS = 60_000
+// square of the turn count. Both budgets are sized against a tokens-per-minute
+// limit rather than the model's context window: at roughly 4 chars per token a
+// full history is ~30k tokens, so a MAX_ITERATIONS task stays inside gpt-5's
+// 500k TPM. Caching makes the resend cheap but not free — cached tokens are
+// still counted in full against TPM. Retune these if you change model or tier.
+const val MAX_OUTPUT_CHARS = 6000
+const val MAX_HISTORY_CHARS = 120_000
 
 const val MAX_RETRIES = 5
 const val MAX_RETRY_WAIT_MS = 60_000L
@@ -161,7 +165,18 @@ fun trimHistory(messages: MutableList<JsonObject>) {
 // 2. CORE AGENT HARNESS LOOP
 // ==========================================
 
-data class Turn(val message: JsonObject, val promptTokens: Long, val completionTokens: Long)
+/**
+ * One model turn. Cached prompt tokens are a subset of [promptTokens], and
+ * reasoning tokens a subset of [completionTokens] — both are broken out because
+ * they are priced or spent differently from the rest.
+ */
+data class Turn(
+    val message: JsonObject,
+    val promptTokens: Long,
+    val cachedPromptTokens: Long,
+    val completionTokens: Long,
+    val reasoningTokens: Long
+)
 
 class BashAgentHarness(private val workspace: File, private val apiKey: String) {
     private val bash = BashTool(workspace)
@@ -179,6 +194,7 @@ class BashAgentHarness(private val workspace: File, private val apiKey: String) 
         private set
 
     private var promptTokens = 0L
+    private var cachedPromptTokens = 0L
     private var completionTokens = 0L
 
     private val systemPrompt = """
@@ -238,6 +254,7 @@ class BashAgentHarness(private val workspace: File, private val apiKey: String) 
                 }
 
                 promptTokens += turn.promptTokens
+                cachedPromptTokens += turn.cachedPromptTokens
                 completionTokens += turn.completionTokens
                 printUsage(turn)
 
@@ -306,18 +323,29 @@ class BashAgentHarness(private val workspace: File, private val apiKey: String) 
     }
 
     private fun printUsage(turn: Turn) {
-        val cost = cost(turn.promptTokens, turn.completionTokens)
+        val cached = if (turn.cachedPromptTokens > 0) " (%,d cached)".format(Locale.ROOT, turn.cachedPromptTokens) else ""
+        val reasoning = if (turn.reasoningTokens > 0) " (%,d reasoning)".format(Locale.ROOT, turn.reasoningTokens) else ""
         println(
-            "📊 %,d in / %,d out · \$%.4f · session \$%.4f"
+            "📊 %,d in$cached / %,d out$reasoning · \$%.4f · session \$%.4f"
                 // ROOT: a dollar figure keeps its dot whatever the console locale is.
-                .format(Locale.ROOT, turn.promptTokens, turn.completionTokens, cost, sessionCost())
+                .format(
+                    Locale.ROOT,
+                    turn.promptTokens,
+                    turn.completionTokens,
+                    cost(turn.promptTokens, turn.cachedPromptTokens, turn.completionTokens),
+                    sessionCost()
+                )
         )
     }
 
-    fun sessionCost() = cost(promptTokens, completionTokens)
+    fun sessionCost() = cost(promptTokens, cachedPromptTokens, completionTokens)
 
-    private fun cost(input: Long, output: Long) =
-        input / 1_000_000.0 * INPUT_USD_PER_1M + output / 1_000_000.0 * OUTPUT_USD_PER_1M
+    // The API reports cached tokens as a subset of the prompt total, so the
+    // uncached remainder is what gets charged at the full input rate.
+    private fun cost(input: Long, cached: Long, output: Long) =
+        (input - cached) / 1_000_000.0 * INPUT_USD_PER_1M +
+            cached / 1_000_000.0 * CACHED_INPUT_USD_PER_1M +
+            output / 1_000_000.0 * OUTPUT_USD_PER_1M
 }
 
 // ==========================================
@@ -386,7 +414,8 @@ fun callOpenAI(
     val payload = buildJsonObject {
         put("model", MODEL)
         put("messages", JsonArray(messages))
-        put("temperature", 0.1)
+        // No "temperature": GPT-5 is a reasoning model and does not take one.
+        // Use "reasoning_effort" (low/medium/high) to trade quality for tokens.
         putJsonArray("tools") {
             addJsonObject {
                 put("type", "function")
@@ -449,10 +478,18 @@ fun callOpenAI(
         ?: throw Exception("API response did not contain choices[0].message: ${response.body()}")
 
     val usage = body["usage"]?.jsonObject
+    fun count(vararg path: String): Long {
+        var node: JsonObject? = usage
+        for (key in path.dropLast(1)) node = node?.get(key) as? JsonObject
+        return node?.get(path.last())?.jsonPrimitive?.longOrNull ?: 0L
+    }
+
     return Turn(
         message = message,
-        promptTokens = usage?.get("prompt_tokens")?.jsonPrimitive?.longOrNull ?: 0L,
-        completionTokens = usage?.get("completion_tokens")?.jsonPrimitive?.longOrNull ?: 0L
+        promptTokens = count("prompt_tokens"),
+        cachedPromptTokens = count("prompt_tokens_details", "cached_tokens"),
+        completionTokens = count("completion_tokens"),
+        reasoningTokens = count("completion_tokens_details", "reasoning_tokens")
     )
 }
 
