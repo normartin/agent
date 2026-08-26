@@ -6,18 +6,7 @@ import io.kotest.matchers.shouldBe
 import io.kotest.matchers.string.shouldContain
 import kotlin.concurrent.thread
 
-/**
- * Counts processes whose command line carries [marker].
- *
- * The first character is wrapped in a character class so the pattern matches
- * the marker but not the pgrep command line that contains the pattern — without
- * that, this helper counts itself and the test flakes.
- */
-private fun processesMatching(marker: String): Int {
-    val selfExcluding = "[" + marker.first() + "]" + marker.drop(1)
-    return ProcessBuilder("bash", "-c", "pgrep -f '$selfExcluding' | wc -l")
-        .start().inputStream.bufferedReader().readText().trim().toInt()
-}
+// processesMatching lives in ProcessProbe.kt — BackgroundJobsTest needs it too.
 
 class BashToolTest : FunSpec({
 

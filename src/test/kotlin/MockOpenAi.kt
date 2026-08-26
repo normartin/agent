@@ -100,3 +100,23 @@ fun finalAnswerBody(text: String) = """
   "usage": { "input_tokens": 50, "output_tokens": 10 }
 }
 """
+
+/**
+ * A turn that calls the jobs tool. [arguments] is the JSON the model would send,
+ * escaped here the way the API carries it: as a string inside the item.
+ */
+fun jobsCallBody(arguments: String, callId: String = "call_jobs1") = """
+{
+  "output": [
+    { "type": "reasoning", "id": "rs_jobs", "summary": [] },
+    {
+      "type": "function_call",
+      "id": "fc_jobs",
+      "call_id": "$callId",
+      "name": "jobs",
+      "arguments": "${arguments.replace("\"", "\\\"")}"
+    }
+  ],
+  "usage": { "input_tokens": 10, "output_tokens": 5 }
+}
+"""

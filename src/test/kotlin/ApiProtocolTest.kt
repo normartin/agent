@@ -38,24 +38,46 @@ class ApiProtocolTest : FunSpec({
             }
         }
 
-        test("declares exactly one bash function tool, flat") {
+        test("declares the bash and jobs tools, flat") {
             MockOpenAi().use { mock ->
                 mock.call()
                 val tools = mock.requests.single().json()["tools"]!!.jsonArray
-                tools.size shouldBe 1
+                tools.map { it.jsonObject["name"]!!.jsonPrimitive.content } shouldBe
+                    listOf("bash", "jobs")
 
                 // Responses puts name/description/parameters on the tool itself.
                 // The chat-completions "function" wrapper is a 400 here.
-                val tool = tools.single().jsonObject
-                tool["function"] shouldBe null
-                tool["type"]!!.jsonPrimitive.content shouldBe "function"
-                tool["name"]!!.jsonPrimitive.content shouldBe "bash"
+                tools.forEach { entry ->
+                    val tool = entry.jsonObject
+                    tool["function"] shouldBe null
+                    tool["type"]!!.jsonPrimitive.content shouldBe "function"
+                }
 
-                val parameters = tool["parameters"]!!.jsonObject
+                val parameters = tools.first().jsonObject["parameters"]!!.jsonObject
                 val command = parameters["properties"]!!.jsonObject["command"]!!.jsonObject
                 command["type"]!!.jsonPrimitive.content shouldBe "string"
                 parameters["required"]!!.jsonArray
                     .map { it.jsonPrimitive.content } shouldBe listOf("command")
+            }
+        }
+
+        test("the jobs tool multiplexes its four actions onto one enum") {
+            MockOpenAi().use { mock ->
+                mock.call()
+                val jobs = mock.requests.single().json()["tools"]!!.jsonArray
+                    .map { it.jsonObject }.single { it.str("name") == "jobs" }
+
+                val parameters = jobs["parameters"]!!.jsonObject
+                val properties = parameters["properties"]!!.jsonObject
+                properties.keys shouldBe setOf("action", "command", "name", "seconds")
+
+                // Only the action is required: each of the four needs a
+                // different subset of the rest.
+                parameters["required"]!!.jsonArray
+                    .map { it.jsonPrimitive.content } shouldBe listOf("action")
+                properties["action"]!!.jsonObject["enum"]!!.jsonArray
+                    .map { it.jsonPrimitive.content } shouldBe
+                    listOf("start", "stop", "output", "wait")
             }
         }
 
