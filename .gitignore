@@ -1,1 +1,3 @@
 agent_workspace/
+.gradle/
+build/

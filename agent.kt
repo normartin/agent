@@ -50,6 +50,10 @@ const val TIMEOUT_SECONDS = 120L
 const val MAX_OUTPUT_CHARS = 6000
 const val MAX_HISTORY_CHARS = 120_000
 
+// Point this at a proxy or a local OpenAI-compatible server if you want one;
+// the tests use it to stand up a mock in-process.
+val API_BASE = System.getenv("OPENAI_BASE_URL")?.trimEnd('/') ?: "https://api.openai.com"
+
 const val MAX_RETRIES = 5
 const val MAX_RETRY_WAIT_MS = 60_000L
 
@@ -57,7 +61,10 @@ const val MAX_RETRY_WAIT_MS = 60_000L
 // 1. BASH EXECUTION
 // ==========================================
 
-class BashTool(private val workspace: File) {
+class BashTool(
+    private val workspace: File,
+    private val timeoutSeconds: Long = TIMEOUT_SECONDS
+) {
     @Volatile
     private var current: Process? = null
 
@@ -92,7 +99,7 @@ class BashTool(private val workspace: File) {
             val outDrain = thread { runCatching { out.append(process.inputStream.bufferedReader().readText()) } }
             val errDrain = thread { runCatching { err.append(process.errorStream.bufferedReader().readText()) } }
 
-            val finished = process.waitFor(TIMEOUT_SECONDS, TimeUnit.SECONDS)
+            val finished = process.waitFor(timeoutSeconds, TimeUnit.SECONDS)
             if (!finished) {
                 // Kill descendants first: a surviving grandchild keeps the pipes
                 // open and the drain threads never see EOF.
@@ -111,7 +118,7 @@ class BashTool(private val workspace: File) {
                 if (err.isNotBlank()) append("ERROR OUTPUT:\n").append(err)
                 when {
                     killedByUser -> append("\n[Interrupted by the user — process killed]")
-                    !finished -> append("\n[TIMED OUT after ${TIMEOUT_SECONDS}s — process killed. Output above is partial.]")
+                    !finished -> append("\n[TIMED OUT after ${timeoutSeconds}s — process killed. Output above is partial.]")
                     else -> append("\n[Exit Code: ${process.exitValue()}]")
                 }
             }
@@ -160,6 +167,16 @@ fun trimHistory(messages: MutableList<JsonObject>) {
         println("🧹 Trimmed ${drop - 1} old message(s) to stay inside the context budget.")
     }
 }
+
+/**
+ * What one turn's token usage costs, in USD. The API reports cached tokens as a
+ * subset of the prompt total, so the uncached remainder is what gets charged at
+ * the full input rate — counting both would overstate the bill tenfold.
+ */
+fun turnCost(input: Long, cached: Long, output: Long) =
+    (input - cached) / 1_000_000.0 * INPUT_USD_PER_1M +
+        cached / 1_000_000.0 * CACHED_INPUT_USD_PER_1M +
+        output / 1_000_000.0 * OUTPUT_USD_PER_1M
 
 // ==========================================
 // 2. CORE AGENT HARNESS LOOP
@@ -249,7 +266,9 @@ class BashAgentHarness(private val workspace: File, private val apiKey: String) 
                     callOpenAI(httpClient, messages, apiKey) { interrupted }
                 } catch (e: Exception) {
                     if (interrupted) println("\n⏹️ Interrupted. Ask again to continue.")
-                    else println("❌ API Error: ${e.message}")
+                    // Fall back to the exception itself: a connection failure
+                    // carries no message, and "API Error: null" says nothing.
+                    else println("❌ API Error: ${e.message ?: e}")
                     return
                 }
 
@@ -332,20 +351,13 @@ class BashAgentHarness(private val workspace: File, private val apiKey: String) 
                     Locale.ROOT,
                     turn.promptTokens,
                     turn.completionTokens,
-                    cost(turn.promptTokens, turn.cachedPromptTokens, turn.completionTokens),
+                    turnCost(turn.promptTokens, turn.cachedPromptTokens, turn.completionTokens),
                     sessionCost()
                 )
         )
     }
 
-    fun sessionCost() = cost(promptTokens, cachedPromptTokens, completionTokens)
-
-    // The API reports cached tokens as a subset of the prompt total, so the
-    // uncached remainder is what gets charged at the full input rate.
-    private fun cost(input: Long, cached: Long, output: Long) =
-        (input - cached) / 1_000_000.0 * INPUT_USD_PER_1M +
-            cached / 1_000_000.0 * CACHED_INPUT_USD_PER_1M +
-            output / 1_000_000.0 * OUTPUT_USD_PER_1M
+    fun sessionCost() = turnCost(promptTokens, cachedPromptTokens, completionTokens)
 }
 
 // ==========================================
@@ -409,6 +421,7 @@ fun callOpenAI(
     client: HttpClient,
     messages: List<JsonObject>,
     apiKey: String,
+    baseUrl: String = API_BASE,
     cancelled: () -> Boolean = { false }
 ): Turn {
     val payload = buildJsonObject {
@@ -438,7 +451,7 @@ fun callOpenAI(
     }.toString()
 
     val request = HttpRequest.newBuilder()
-        .uri(URI.create("https://api.openai.com/v1/chat/completions"))
+        .uri(URI.create("$baseUrl/v1/chat/completions"))
         .timeout(Duration.ofSeconds(120))
         .header("Authorization", "Bearer $apiKey")
         .header("Content-Type", "application/json")
