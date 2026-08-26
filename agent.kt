@@ -87,6 +87,18 @@ class BashAgentHarness(private val workspace: File, private val apiKey: String) 
           "bashCommand": "The exact shell command to run next" or null,
           "finalAnswer": "Your reply to the user once the request is handled" or null
         }
+
+        Rules for that object:
+        - Exactly one of "bashCommand" and "finalAnswer" is set; the other is null.
+          Never set both. If a command is set, "finalAnswer" MUST be null.
+        - You act one command per turn. You do not see a command's output until the
+          next turn, so never describe what a command produced in the same message
+          that requests it.
+        - Only write "finalAnswer" after the shell output you already received shows
+          the work is done. Never report files, directories or builds as created
+          before a command has actually created them.
+        - Chain related steps with && or write a small script when one turn should
+          do several things.
     """.trimIndent()
 
     init {
@@ -126,17 +138,19 @@ class BashAgentHarness(private val workspace: File, private val apiKey: String) 
 
             println("🤔 Reasoning: ${step.reasoning}")
 
-            if (step.finalAnswer != null) {
-                println("\n✅ ${step.finalAnswer}")
-                messages.add("assistant" to rawResponse)
-                isRunning = false
-            } else if (step.bashCommand != null) {
+            // A command wins over a final answer: models routinely fill in both,
+            // announcing work they have not actually run yet.
+            if (step.bashCommand != null) {
                 println("💻 Executing Bash: ${step.bashCommand}")
                 val output = bash.execute(step.bashCommand)
                 println("📥 Shell Output:\n$output\n")
 
                 messages.add("assistant" to rawResponse)
                 messages.add("user" to "Command output:\n$output")
+            } else if (step.finalAnswer != null) {
+                println("\n✅ ${step.finalAnswer}")
+                messages.add("assistant" to rawResponse)
+                isRunning = false
             } else {
                 println("⚠️ Warning: No command and no final answer provided.")
                 messages.add("assistant" to rawResponse)
@@ -161,7 +175,7 @@ class BashAgentHarness(private val workspace: File, private val apiKey: String) 
 fun callOpenAI(client: HttpClient, messages: List<Pair<String, String>>, apiKey: String): String {
     val payload = JsonObject(
         mapOf(
-            "model" to JsonPrimitive("gpt-4o-mini"),
+            "model" to JsonPrimitive("gpt-4o"),
             "messages" to JsonArray(
                 messages.map { (role, content) ->
                     JsonObject(
@@ -206,7 +220,14 @@ fun callOpenAI(client: HttpClient, messages: List<Pair<String, String>>, apiKey:
 
 fun parseJson(rawJson: String): AgentResponse {
     val json = Json.parseToJsonElement(rawJson).jsonObject
-    fun extract(key: String): String? = json[key]?.jsonPrimitive?.contentOrNull
+
+    // Treat "", "null" and "none" as an absent field: models write those instead
+    // of a JSON null, and an empty bashCommand would otherwise run as a command.
+    fun extract(key: String): String? = json[key]
+        ?.jsonPrimitive
+        ?.contentOrNull
+        ?.trim()
+        ?.takeUnless { it.isEmpty() || it.equals("null", ignoreCase = true) || it.equals("none", ignoreCase = true) }
 
     return AgentResponse(
         reasoning = extract("reasoning") ?: "Thinking...",
