@@ -23,7 +23,7 @@ class HarnessJobsTest : FunSpec({
             mock.script(
                 // Start something short, then spend a turn in the foreground so
                 // it is certainly over by the time the third request is built.
-                Reply(200, jobsCallBody("""{"action":"start","command":"echo ingested","name":"probe"}""")),
+                Reply(200, actionCallBody("""{"action":"start","command":"echo ingested","name":"probe"}""")),
                 Reply(200, toolCallBody(command = "sleep 2")),
                 Reply(200, finalAnswerBody("done"))
             )
@@ -48,7 +48,7 @@ class HarnessJobsTest : FunSpec({
     test("each user turn is preceded by what is still running") {
         MockOpenAi().use { mock ->
             mock.script(
-                Reply(200, jobsCallBody("""{"action":"start","command":"sleep 30","name":"server"}""")),
+                Reply(200, actionCallBody("""{"action":"start","command":"sleep 30","name":"server"}""")),
                 Reply(200, finalAnswerBody("started it")),
                 Reply(200, finalAnswerBody("still going"))
             )
@@ -71,8 +71,8 @@ class HarnessJobsTest : FunSpec({
         val marker = "kotest-harness-stop-marker"
         MockOpenAi().use { mock ->
             mock.script(
-                Reply(200, jobsCallBody("""{"action":"start","command":"sleep 300 # $marker","name":"hog"}""")),
-                Reply(200, jobsCallBody("""{"action":"stop","name":"hog"}""", callId = "call_jobs2")),
+                Reply(200, actionCallBody("""{"action":"start","command":"sleep 300 # $marker","name":"hog"}""")),
+                Reply(200, actionCallBody("""{"action":"stop","name":"hog"}""", callId = "call_jobs2")),
                 Reply(200, finalAnswerBody("stopped"))
             )
             val harness = BashAgentHarness(workspace, "test-key", mock.baseUrl)
@@ -88,11 +88,11 @@ class HarnessJobsTest : FunSpec({
         }
     }
 
-    test("an unusable jobs call is answered rather than left dangling") {
+    test("an unusable job action is answered rather than left dangling") {
         MockOpenAi().use { mock ->
             mock.script(
-                Reply(200, jobsCallBody("""{"action":"wait","name":"ghost"}""")),
-                Reply(200, jobsCallBody("""{"action":"start"}""", callId = "call_jobs2")),
+                Reply(200, actionCallBody("""{"action":"wait","name":"ghost"}""")),
+                Reply(200, actionCallBody("""{"action":"start"}""", callId = "call_jobs2")),
                 Reply(200, finalAnswerBody("gave up"))
             )
             val harness = BashAgentHarness(workspace, "test-key", mock.baseUrl)
@@ -112,7 +112,7 @@ class HarnessJobsTest : FunSpec({
         test("resume runs a turn the user never asked for and delivers the result") {
             MockOpenAi().use { mock ->
                 mock.script(
-                    Reply(200, jobsCallBody("""{"action":"start","command":"echo woke-you-up","name":"alarm"}""")),
+                    Reply(200, actionCallBody("""{"action":"start","command":"echo woke-you-up","name":"alarm"}""")),
                     Reply(200, finalAnswerBody("started it")),
                     Reply(200, finalAnswerBody("the job printed woke-you-up"))
                 )
@@ -137,7 +137,7 @@ class HarnessJobsTest : FunSpec({
         test("resume spends nothing when the result already reached the model") {
             MockOpenAi().use { mock ->
                 mock.script(
-                    Reply(200, jobsCallBody("""{"action":"start","command":"echo quick","name":"quick"}""")),
+                    Reply(200, actionCallBody("""{"action":"start","command":"echo quick","name":"quick"}""")),
                     Reply(200, toolCallBody(command = "sleep 2")),
                     Reply(200, finalAnswerBody("done"))
                 )
@@ -157,8 +157,8 @@ class HarnessJobsTest : FunSpec({
         test("a job the model stopped does not wake anyone") {
             MockOpenAi().use { mock ->
                 mock.script(
-                    Reply(200, jobsCallBody("""{"action":"start","command":"sleep 300","name":"doomed"}""")),
-                    Reply(200, jobsCallBody("""{"action":"stop","name":"doomed"}""", callId = "call_jobs2")),
+                    Reply(200, actionCallBody("""{"action":"start","command":"sleep 300","name":"doomed"}""")),
+                    Reply(200, actionCallBody("""{"action":"stop","name":"doomed"}""", callId = "call_jobs2")),
                     Reply(200, finalAnswerBody("stopped"))
                 )
                 val harness = BashAgentHarness(workspace, "test-key", mock.baseUrl)
@@ -191,7 +191,7 @@ class HarnessJobsTest : FunSpec({
         val marker = "kotest-harness-shutdown-marker"
         MockOpenAi().use { mock ->
             mock.script(
-                Reply(200, jobsCallBody("""{"action":"start","command":"sleep 300 & sleep 300 # $marker"}""")),
+                Reply(200, actionCallBody("""{"action":"start","command":"sleep 300 & sleep 300 # $marker"}""")),
                 Reply(200, finalAnswerBody("running"))
             )
             val harness = BashAgentHarness(workspace, "test-key", mock.baseUrl)

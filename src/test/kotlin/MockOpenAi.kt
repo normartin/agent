@@ -102,10 +102,12 @@ fun finalAnswerBody(text: String) = """
 """
 
 /**
- * A turn that calls the jobs tool. [arguments] is the JSON the model would send,
- * escaped here the way the API carries it: as a string inside the item.
+ * A turn that calls the bash tool with an explicit action — the job verbs, and
+ * "run" when a test wants to spell it out. [arguments] is the JSON the model
+ * would send, escaped here the way the API carries it: as a string inside the
+ * item. [toolCallBody] covers the other shape, a bare command with no action.
  */
-fun jobsCallBody(arguments: String, callId: String = "call_jobs1") = """
+fun actionCallBody(arguments: String, callId: String = "call_jobs1") = """
 {
   "output": [
     { "type": "reasoning", "id": "rs_jobs", "summary": [] },
@@ -113,7 +115,7 @@ fun jobsCallBody(arguments: String, callId: String = "call_jobs1") = """
       "type": "function_call",
       "id": "fc_jobs",
       "call_id": "$callId",
-      "name": "jobs",
+      "name": "bash",
       "arguments": "${arguments.replace("\"", "\\\"")}"
     }
   ],

@@ -38,46 +38,40 @@ class ApiProtocolTest : FunSpec({
             }
         }
 
-        test("declares the bash and jobs tools, flat") {
+        test("declares the one bash tool, flat") {
             MockOpenAi().use { mock ->
                 mock.call()
                 val tools = mock.requests.single().json()["tools"]!!.jsonArray
-                tools.map { it.jsonObject["name"]!!.jsonPrimitive.content } shouldBe
-                    listOf("bash", "jobs")
+                tools.map { it.jsonObject["name"]!!.jsonPrimitive.content } shouldBe listOf("bash")
 
                 // Responses puts name/description/parameters on the tool itself.
                 // The chat-completions "function" wrapper is a 400 here.
-                tools.forEach { entry ->
-                    val tool = entry.jsonObject
-                    tool["function"] shouldBe null
-                    tool["type"]!!.jsonPrimitive.content shouldBe "function"
-                }
-
-                val parameters = tools.first().jsonObject["parameters"]!!.jsonObject
-                val command = parameters["properties"]!!.jsonObject["command"]!!.jsonObject
-                command["type"]!!.jsonPrimitive.content shouldBe "string"
-                parameters["required"]!!.jsonArray
-                    .map { it.jsonPrimitive.content } shouldBe listOf("command")
+                val tool = tools.single().jsonObject
+                tool["function"] shouldBe null
+                tool["type"]!!.jsonPrimitive.content shouldBe "function"
             }
         }
 
-        test("the jobs tool multiplexes its four actions onto one enum") {
+        test("the bash tool multiplexes its five actions onto one enum") {
             MockOpenAi().use { mock ->
                 mock.call()
-                val jobs = mock.requests.single().json()["tools"]!!.jsonArray
-                    .map { it.jsonObject }.single { it.str("name") == "jobs" }
+                val bash = mock.requests.single().json()["tools"]!!.jsonArray
+                    .map { it.jsonObject }.single { it.str("name") == "bash" }
 
-                val parameters = jobs["parameters"]!!.jsonObject
+                val parameters = bash["parameters"]!!.jsonObject
                 val properties = parameters["properties"]!!.jsonObject
                 properties.keys shouldBe setOf("action", "command", "name", "seconds")
+                properties["command"]!!.jsonObject["type"]!!.jsonPrimitive.content shouldBe "string"
 
-                // Only the action is required: each of the four needs a
-                // different subset of the rest.
-                parameters["required"]!!.jsonArray
-                    .map { it.jsonPrimitive.content } shouldBe listOf("action")
                 properties["action"]!!.jsonObject["enum"]!!.jsonArray
                     .map { it.jsonPrimitive.content } shouldBe
-                    listOf("start", "stop", "output", "wait")
+                    listOf("run", "start", "output", "wait", "stop")
+
+                // Nothing is required: "run" needs only a command and the job
+                // actions only a name, and the schema cannot say "one or the
+                // other". Requiring "action" would also cost the commonest call
+                // in the loop a word it does not otherwise have to write.
+                parameters["required"] shouldBe null
             }
         }
 

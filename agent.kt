@@ -61,79 +61,7 @@ val API_BASE = System.getenv("OPENAI_BASE_URL")?.trimEnd('/') ?: "https://api.op
 const val MAX_RETRIES = 5
 const val MAX_RETRY_WAIT_MS = 60_000L
 
-// ---------- 1. Bash execution ----------
-
-/** Reads a stream to EOF; a failed read counts as no output. */
-private fun InputStream.readTextOrEmpty() =
-    runCatching { bufferedReader().readText() }.getOrDefault("")
-
-class BashTool(
-    private val workspace: File,
-    private val timeoutSeconds: Long = TIMEOUT_SECONDS
-) {
-    @Volatile
-    private var current: Process? = null
-
-    @Volatile
-    private var killedByUser = false
-
-    /** Kills the running command, if any. Called from the Ctrl+C handler thread. */
-    fun kill() {
-        current?.let { process ->
-            killedByUser = true
-            process.descendants().forEach { it.destroyForcibly() }
-            process.destroyForcibly()
-        }
-    }
-
-    fun execute(command: String): String {
-        killedByUser = false
-        return try {
-            val process = ProcessBuilder("bash", "-c", command)
-                .directory(workspace)
-                // No console input: an interactive command would otherwise steal
-                // the chat input or block forever.
-                .redirectInput(ProcessBuilder.Redirect.from(File("/dev/null")))
-                .start()
-            current = process
-
-            // Drain both streams on their own threads: reading them one after the
-            // other deadlocks as soon as the unread one fills its pipe buffer.
-            // The joins below are what publish these captured vars back to here.
-            var out = ""
-            var err = ""
-            val outDrain = thread { out = process.inputStream.readTextOrEmpty() }
-            val errDrain = thread { err = process.errorStream.readTextOrEmpty() }
-
-            val finished = process.waitFor(timeoutSeconds, TimeUnit.SECONDS)
-            if (!finished) {
-                // Descendants first: a surviving grandchild keeps the pipes open
-                // and the drain threads never see EOF.
-                process.descendants().forEach { it.destroyForcibly() }
-                process.destroyForcibly()
-                process.waitFor()
-            }
-            // The drains end on their own once the pipes close; the grace period
-            // only bounds the pathological case.
-            outDrain.join(2000)
-            errDrain.join(2000)
-            current = null
-
-            buildString {
-                if (out.isNotBlank()) append(out)
-                if (err.isNotBlank()) append("ERROR OUTPUT:\n").append(err)
-                when {
-                    killedByUser -> append("\n[Interrupted by the user — process killed]")
-                    !finished -> append("\n[TIMED OUT after ${timeoutSeconds}s — process killed. Output above is partial.]")
-                    else -> append("\n[Exit Code: ${process.exitValue()}]")
-                }
-            }
-        } catch (e: Exception) {
-            current = null
-            "Execution Error: ${e.message}"
-        }
-    }
-}
+// ---------- 1. Command execution ----------
 
 /**
  * Caps a command's output before it enters the history. Keeps head and tail:
@@ -146,8 +74,6 @@ fun truncate(text: String): String {
     val tail = text.takeLast(MAX_OUTPUT_CHARS / 3)
     return "$head\n… [${text.length - head.length - tail.length} chars elided] …\n$tail"
 }
-
-// ---------- 1b. Background jobs ----------
 
 /**
  * A capped buffer that a drain thread can append to for hours. It keeps the same
@@ -308,15 +234,19 @@ class BackgroundJob(
         }
     }
 
-    /** The output so far, in the same shape the foreground tool returns. */
-    fun report() = buildString {
+    /**
+     * The output so far. [note] replaces the trailing status line, which is how
+     * a foreground run says "timed out" or "interrupted" without this class
+     * having to know which of the two it is running as.
+     */
+    fun report(note: String? = null) = buildString {
         val stdout = out.snapshot()
         val stderr = err.snapshot()
         if (stdout.isNotBlank()) append(stdout)
         if (stderr.isNotBlank()) append("ERROR OUTPUT:\n").append(stderr)
         append("\n")
         append(
-            when (state) {
+            note ?: when (state) {
                 JobState.RUNNING -> "[Still running after ${elapsedSeconds}s]"
                 JobState.KILLED -> "[Killed after ${elapsedSeconds}s]"
                 JobState.EXITED -> "[Exit Code: ${exitCode ?: "unknown"} after ${elapsedSeconds}s]"
@@ -326,8 +256,13 @@ class BackgroundJob(
 }
 
 /**
- * The live background jobs, by name. Finished ones are kept so their output can
- * still be asked for after it has been delivered.
+ * Every command the harness runs, foreground and background alike. The two
+ * differ only in who waits for them: a foreground command is awaited by the
+ * turn that asked for it, a background one outlives that turn and is looked up
+ * by name afterwards. Only the latter are registered here.
+ *
+ * Finished background jobs are kept so their output can still be asked for
+ * after it has been delivered.
  *
  * Every method is synchronised because the names have to be allocated and the
  * map written under one lock; the waiting happens on [BackgroundJob] itself, so
@@ -341,17 +276,56 @@ class JobRegistry(
     private val jobs = LinkedHashMap<String, BackgroundJob>()
     private var counter = 0
 
+    /** The foreground command, while there is one. Ctrl+C is what stops it. */
+    @Volatile
+    private var foreground: BackgroundJob? = null
+
+    /** Launches [command] under bash in the workspace. */
+    private fun launch(command: String) = ProcessBuilder("bash", "-c", command)
+        .directory(workspace)
+        // No console input: an interactive command would otherwise steal the
+        // chat input or block forever.
+        .redirectInput(ProcessBuilder.Redirect.from(File("/dev/null")))
+        .start()
+
     /** Starts [command] detached. Throws only if the process will not launch. */
     fun start(command: String, requested: String? = null): BackgroundJob {
-        val process = ProcessBuilder("bash", "-c", command)
-            .directory(workspace)
-            // Same as the foreground tool: an interactive command would
-            // otherwise steal the chat input or block forever.
-            .redirectInput(ProcessBuilder.Redirect.from(File("/dev/null")))
-            .start()
+        val process = launch(command)
         return synchronized(this) {
             BackgroundJob(nameFor(requested), command, process, onFinished).also { jobs[it.name] = it }
         }
+    }
+
+    /**
+     * Runs [command] and waits for it, killing it at [seconds]. Returns the job
+     * either way, so the caller can read its log and tell the two apart.
+     *
+     * Deliberately not registered: the turn that started it is standing right
+     * here waiting, so it needs no name to be referred to by later and has
+     * nothing to deliver once this returns. Not passing [onFinished] on is the
+     * other half of that — a foreground command must not wake the console.
+     */
+    fun run(command: String, seconds: Long, cancelled: () -> Boolean): BackgroundJob {
+        val job = BackgroundJob("foreground", command, launch(command))
+        foreground = job
+        try {
+            // Polls in slices rather than blocking outright, so Ctrl+C and the
+            // deadline are both felt while the command is still running.
+            if (!job.await(seconds, cancelled)) {
+                job.stop()
+                // The log is only complete once the watcher has joined the
+                // drains, and stop() does not wait for that.
+                job.awaitFor(2000)
+            }
+            return job
+        } finally {
+            foreground = null
+        }
+    }
+
+    /** Kills the foreground command, if any. Called from the Ctrl+C handler. */
+    fun interruptForeground() {
+        foreground?.stop()
     }
 
     /**
@@ -550,11 +524,12 @@ class BashAgentHarness(
     // Injected so a test can point the harness at a stand-in server; main()
     // leaves it at the environment-derived default.
     private val baseUrl: String = API_BASE,
+    // Injected for the same reason: a test cannot wait out the real deadline.
+    private val timeoutSeconds: Long = TIMEOUT_SECONDS,
     // Rung from a job's watcher thread when it finishes. The console turns this
     // into an event; [resume] is what acts on it.
     onJobFinished: (BackgroundJob) -> Unit = {}
 ) {
-    private val bash = BashTool(workspace)
     private val jobs = JobRegistry(workspace, onJobFinished)
     private val input = mutableListOf<JsonObject>()
     private val httpClient = HttpClient.newBuilder()
@@ -583,11 +558,12 @@ class BashAgentHarness(
         the user instead of inventing extra work.
 
         Chain related steps with && or write a small script when one turn should do
-        several things. Commands are killed after ${TIMEOUT_SECONDS}s, so never start a
-        server or another long-running process in the foreground. Long output is
-        truncated in the middle before you see it.
+        several things. A command runs in the foreground and is killed after
+        ${TIMEOUT_SECONDS}s, so never start a server or another long-running process
+        that way. Long output is truncated in the middle before you see it.
 
-        Anything slower than that goes in the background, through the "jobs" tool:
+        Anything slower goes in the background — same tool, one extra word:
+          {"command":"ls -la"}                  foreground, the default
           {"action":"start","command":"./gradlew build","name":"build"}
           {"action":"output","name":"server"}   what it has printed so far
           {"action":"wait","name":"build","seconds":120}
@@ -628,7 +604,7 @@ class BashAgentHarness(
      */
     fun interrupt() {
         interrupted = true
-        bash.kill()
+        jobs.interruptForeground()
     }
 
     /** Kills every background job. The last thing the session does. */
@@ -743,11 +719,10 @@ class BashAgentHarness(
         val result = when {
             interrupted -> "[Skipped: interrupted by the user]"
             args == null -> "Execution Error: the tool call's arguments were not a JSON object (got: $rawArgs)"
-            else -> when (val tool = call.str("name")) {
-                "bash" -> runBashCall(args, rawArgs)
-                "jobs" -> runJobsCall(args)
-                else -> "Execution Error: there is no tool named '$tool'."
-            }
+            call.str("name") != "bash" ->
+                "Execution Error: there is no tool named '${call.str("name")}'."
+
+            else -> runBashCall(args, rawArgs)
         }
         println("📥 Output:\n$result\n")
 
@@ -758,24 +733,23 @@ class BashAgentHarness(
         }
     }
 
+    /** The bash tool: one action per call, dispatched here. */
     private fun runBashCall(args: JsonObject, rawArgs: String): String {
-        val command = args.str("command")
-        if (command.isNullOrBlank()) {
-            return "Execution Error: the tool call carried no 'command' argument (got: $rawArgs)"
-        }
-        println("💻 Executing Bash: $command")
-        return truncate(bash.execute(command))
-    }
-
-    /** The jobs tool: one action per call, dispatched here. */
-    private fun runJobsCall(args: JsonObject): String {
         val name = args.str("name")
 
-        return when (val action = args.str("action")?.lowercase()) {
-            "start" -> {
-                val command = args.str("command")
-                if (command.isNullOrBlank()) "Execution Error: 'start' needs a 'command'."
-                else runCatching { jobs.start(command, name) }.fold(
+        // An absent action means "run": a plain command is the overwhelmingly
+        // common call, and making it name itself would be a decision per call.
+        return when (val action = args.str("action")?.lowercase() ?: "run") {
+            "run" -> withCommand(args, rawArgs, action) { command ->
+                println("💻 Executing Bash: $command")
+                runCatching { jobs.run(command, timeoutSeconds) { interrupted } }.fold(
+                    onSuccess = { job -> truncate(job.report(foregroundNote(job))) },
+                    onFailure = { "Execution Error: ${it.message}" }
+                )
+            }
+
+            "start" -> withCommand(args, rawArgs, action) { command ->
+                runCatching { jobs.start(command, name) }.fold(
                     onSuccess = { job ->
                         println("🚀 Started background job \"${job.name}\": $command")
                         "Started background job \"${job.name}\". Its output will be delivered to you when it finishes."
@@ -810,9 +784,28 @@ class BashAgentHarness(
                 truncate(job.report())
             }
 
-            else -> "Execution Error: unknown action '$action' — use start, stop, output or wait."
+            else -> "Execution Error: unknown action '$action' — use run, start, stop, output or wait."
         }
     }
+
+    /**
+     * How a foreground run ended, when [BackgroundJob]'s own status line would
+     * be wrong about it: a job it killed reads as "[Killed]", which says nothing
+     * about whether it was the deadline or the user that did it. Null leaves the
+     * exit code standing, which is what a command that finished on its own wants.
+     */
+    private fun foregroundNote(job: BackgroundJob) = when {
+        job.state != JobState.KILLED -> null
+        interrupted -> "[Interrupted by the user — process killed]"
+        else -> "[TIMED OUT after ${timeoutSeconds}s — process killed. Output above is partial.]"
+    }
+
+    /** Resolves the command an action needs, or explains why it could not. */
+    private fun withCommand(args: JsonObject, rawArgs: String, action: String, block: (String) -> String) =
+        args.str("command").let {
+            if (it.isNullOrBlank()) "Execution Error: '$action' needs a 'command' (got: $rawArgs)"
+            else block(it)
+        }
 
     /** Resolves the job an action names, or explains why it could not. */
     private fun withJob(name: String?, block: (BackgroundJob) -> String): String {
@@ -958,51 +951,42 @@ private fun HttpResponse<String>.toTurn(): Turn {
  * and parameters sit on the tool itself, with no "function" wrapper — the
  * chat-completions shape is a 400 here.
  *
- * "jobs" multiplexes four actions onto one tool rather than adding four: the
- * whole set is one concept, and one schema keeps the request — resent in full
- * every iteration — that much smaller.
+ * One tool, five actions, rather than one tool per action: running a command and
+ * managing a command that is still running are the same concept, and a single
+ * schema keeps the request — resent in full every iteration — that much smaller.
+ * "action" is deliberately optional, defaulting to "run": a plain command is the
+ * overwhelmingly common call, so it stays as short to write as it ever was and
+ * only the job actions pay a word.
  */
 val TOOLS = buildJsonArray {
     addJsonObject {
         put("type", "function")
         put("name", "bash")
-        put("description", "Run a shell command in the workspace and return its stdout, stderr and exit code.")
-        putJsonObject("parameters") {
-            put("type", "object")
-            putJsonObject("properties") {
-                putJsonObject("command") {
-                    put("type", "string")
-                    put("description", "The exact shell command to run.")
-                }
-            }
-            putJsonArray("required") { add("command") }
-        }
-    }
-    addJsonObject {
-        put("type", "function")
-        put("name", "jobs")
         put(
             "description",
-            "Manage background commands that outlive the turn that started them: builds, " +
-                "test suites, servers. A finished job's output is delivered to you " +
-                "automatically, so there is no need to poll one."
+            "Run shell commands in the workspace. A command runs in the foreground and is " +
+                "killed after ${TIMEOUT_SECONDS}s; anything slower belongs in the background, " +
+                "where it outlives the turn that started it, is referred to by name, and has " +
+                "its output delivered to you when it finishes."
         )
         putJsonObject("parameters") {
             put("type", "object")
             putJsonObject("properties") {
                 putJsonObject("action") {
                     put("type", "string")
-                    putJsonArray("enum") { add("start"); add("stop"); add("output"); add("wait") }
+                    putJsonArray("enum") { add("run"); add("start"); add("output"); add("wait"); add("stop") }
                     put(
                         "description",
-                        "start: run 'command' in the background. stop: kill a job. " +
+                        "Defaults to \"run\" — omit it to just run a command. " +
+                            "run: execute 'command' and wait for it, killed after ${TIMEOUT_SECONDS}s. " +
+                            "start: run 'command' in the background. " +
                             "output: what a job has printed so far, running or not. " +
-                            "wait: block until a job finishes."
+                            "wait: block until a job finishes. stop: kill a job."
                     )
                 }
                 putJsonObject("command") {
                     put("type", "string")
-                    put("description", "The shell command to run. Required for \"start\".")
+                    put("description", "The exact shell command to run. Required for \"run\" and \"start\".")
                 }
                 putJsonObject("name") {
                     put("type", "string")
@@ -1017,7 +1001,8 @@ val TOOLS = buildJsonArray {
                     put("description", "How long \"wait\" may block. Defaults to $DEFAULT_WAIT_SECONDS, capped at $MAX_WAIT_SECONDS.")
                 }
             }
-            putJsonArray("required") { add("action") }
+            // No "required": "run" needs only a command and the job actions only
+            // a name, and the schema has no way to say "one or the other".
         }
     }
 }
