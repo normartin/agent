@@ -349,10 +349,11 @@ class BashAgentHarness(
         if (killed > 0) println("🛑 Killed $killed background job(s).")
     }
 
-    fun runTask(taskDescription: String) {
+    /** The model's final answer, or null when the task did not finish (API error, interrupt, iteration cap). */
+    fun runTask(taskDescription: String): String? {
         pumpJobs(announceRunning = true) // before the user's message, so their words come last
         input.add(message("user", taskDescription))
-        runLoop()
+        return runLoop()
     }
 
     /** A turn nobody asked for, on the back of a finished job. False when the result already reached the model. */
@@ -363,12 +364,16 @@ class BashAgentHarness(
         return true
     }
 
-    private fun runLoop() {
+    /**
+     * Prints the answer here rather than in the callers: in one-shot mode System.out is already
+     * stderr by then, and the caller writes the returned text to the real stdout itself.
+     */
+    private fun runLoop(): String? {
         interrupted = false
         busy = true
         try {
             repeat(MAX_ITERATIONS) {
-                if (interrupted) return println("\n⏹️ Interrupted. Ask again to continue.")
+                if (interrupted) { println("\n⏹️ Interrupted. Ask again to continue."); return null }
                 pumpJobs(announceRunning = false)
                 trimHistory(input)
 
@@ -379,7 +384,7 @@ class BashAgentHarness(
                     Spinner.stop()
                     if (interrupted) println("\n⏹️ Interrupted. Ask again to continue.")
                     else println("❌ API Error: ${e.message ?: e}")
-                    return
+                    return null
                 } finally {
                     Spinner.stop()
                 }
@@ -399,13 +404,17 @@ class BashAgentHarness(
 
                 val text = assistantText(turn.output)
                 val calls = turn.output.map { it.jsonObject }.filter { it.str("type") == "function_call" }
-                if (calls.isEmpty()) return println("\n✅ ${text ?: "(the model returned neither an answer nor a command)"}")
+                if (calls.isEmpty()) {
+                    println("\n✅ ${text ?: "(the model returned neither an answer nor a command)"}")
+                    return text ?: ""
+                }
                 if (text != null) println("🤔 Reasoning: $text")
 
                 // Every call needs a reply, even skipped ones: a missing one is a 400.
                 calls.forEach { call -> runCall(call)?.let(input::add) }
             }
             println("\n⏹️ Stopped after $MAX_ITERATIONS iterations. Ask again to continue.")
+            return null
         } finally {
             busy = false
         }
@@ -642,7 +651,7 @@ fun callOpenAI(
     }
 }
 
-// ---------- 4. Main entry point (interactive console) ----------
+// ---------- 4. Main entry point (interactive console, or one-shot on a pipe) ----------
 
 /** The console waits on a queue, not stdin: a finishing job must be able to start a turn too. */
 private sealed interface Event {
@@ -660,14 +669,52 @@ fun printHelp() = println(
     Ctrl+C cancels the running task; at the prompt it quits.
     Background jobs survive /reset and a cancelled task; they die with the session.
     Note: requests use store=true, so OpenAI retains this session for about 30 days.
+    Piped stdin (echo "…" | ./agent.kt) runs that one prompt: answer on stdout, log on stderr, then exit.
     """.trimIndent()
 )
 
 fun main() {
     val apiKey = System.getenv("OPENAI_API_KEY").orEmpty()
-    if (apiKey.isBlank()) return println("❌ Please set the 'OPENAI_API_KEY' environment variable.")
-
+    if (apiKey.isBlank()) {
+        System.err.println("❌ Please set the 'OPENAI_API_KEY' environment variable.")
+        exitProcess(2)
+    }
     val workspace = File(".").apply { mkdirs() }.canonicalFile
+
+    // isTerminal(), not a null check: since JDK 22 System.console() exists even for a pipe.
+    if (System.console()?.isTerminal() == true) runConsole(workspace, apiKey) else runOneShot(workspace, apiKey)
+}
+
+/**
+ * Non-interactive mode: all of stdin is the prompt, the answer is all that lands on stdout.
+ * Exit code 0 = answered, 1 = did not finish, 2 = usage.
+ */
+private fun runOneShot(workspace: File, apiKey: String) {
+    // The harness prints progress with println throughout. Swapping System.out for stderr turns all
+    // of it into diagnostics without threading a logger through a single-file harness; the real
+    // stdout is kept aside for the one thing a caller pipes us for.
+    val stdout = System.out
+    System.setOut(System.err)
+
+    val prompt = System.`in`.readBytes().decodeToString().trim()
+    if (prompt.isEmpty()) {
+        System.err.println("❌ No prompt on stdin.")
+        exitProcess(2)
+    }
+
+    val harness = BashAgentHarness(workspace, apiKey)
+    Runtime.getRuntime().addShutdownHook(thread(start = false) { harness.shutdown() })
+    Signal.handle(Signal("INT")) { harness.interrupt() }
+
+    val answer = harness.runTask(prompt)
+    System.err.println("Session cost: \$%.4f".format(Locale.ROOT, harness.sessionCost()))
+    if (answer == null) exitProcess(1)
+    stdout.println(answer)
+    stdout.flush()
+    exitProcess(0) // explicit: a background job's watcher thread would otherwise keep the JVM alive
+}
+
+private fun runConsole(workspace: File, apiKey: String) {
     val events = LinkedBlockingQueue<Event>() // unbounded: put() runs on a job's watcher thread
     val harness = BashAgentHarness(workspace, apiKey) { events.put(Event.JobFinished) }
     fun farewell() = println("\n👋 Bye! Session cost: \$%.4f".format(Locale.ROOT, harness.sessionCost()))
