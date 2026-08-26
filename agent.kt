@@ -1,4 +1,5 @@
 ///usr/bin/env jbang "$0" "$@" ; exit $?
+//JAVA 21+
 //KOTLIN 2.4.10
 //DEPS org.jetbrains.kotlin:kotlin-stdlib:2.4.10
 //DEPS org.jetbrains.kotlinx:kotlinx-serialization-json:1.7.3
@@ -180,6 +181,78 @@ fun turnCost(input: Long, cached: Long, output: Long) =
         cached / 1_000_000.0 * CACHED_INPUT_USD_PER_1M +
         output / 1_000_000.0 * OUTPUT_USD_PER_1M
 
+/**
+ * A one-line "still working" indicator for the stretch where the agent has
+ * nothing to say: the API call. It paints from a daemon thread with a carriage
+ * return, so it overwrites itself and never scrolls anything away.
+ *
+ * Only a real terminal gets it. Piped output and the tests read stdout as text,
+ * and control characters there are noise a caller would have to strip; the
+ * check lives here so no caller needs a guard of its own.
+ */
+object Spinner {
+    private const val FRAMES = "\u2839\u2838\u2834\u2826\u2807\u280F"
+    private const val HIDE_CURSOR = "\u001B[?25l"
+    private const val SHOW_CURSOR = "\u001B[?25h"
+    private const val CLEAR_LINE = "\r\u001B[2K"
+
+    // isTerminal(), not a null check: since JDK 22 System.console() hands back a
+    // Console even when stdout is a pipe, so the null check alone would let the
+    // escapes through to a redirected log or `./gradlew run`.
+    private val enabled = System.console()?.isTerminal() == true
+
+    // Doubles as the running flag: null means "stop", which is what the worker
+    // loop reads on every frame.
+    @Volatile
+    private var label: String? = null
+    private var worker: Thread? = null
+
+    /** Starts painting [text] until [stop]. A second start just retitles. */
+    @Synchronized
+    fun start(text: String) {
+        label = text
+        if (!enabled || worker != null) return
+        val startedAt = System.currentTimeMillis()
+        worker = thread(isDaemon = true, name = "spinner") {
+            print(HIDE_CURSOR)
+            var frame = 0
+            while (true) {
+                val current = label ?: break
+                // The elapsed count is the point: a frozen frame and a slow
+                // call look alike, a climbing clock does not.
+                val seconds = (System.currentTimeMillis() - startedAt) / 1000
+                print("$CLEAR_LINE${FRAMES[frame % FRAMES.length]} $current ${seconds}s")
+                System.out.flush()
+                frame++
+                Thread.sleep(90)
+            }
+        }
+    }
+
+    /** Erases the spinner line and gives the cursor back. Safe to call twice. */
+    @Synchronized
+    fun stop() {
+        label = null
+        val wasRunning = worker != null
+        worker?.join()
+        worker = null
+        if (wasRunning) {
+            print("$CLEAR_LINE$SHOW_CURSOR")
+            System.out.flush()
+        }
+    }
+
+    /**
+     * Prints a line the spinner will not smear across. Anything that has to
+     * speak mid-call — the retry notice — goes through here instead of println.
+     */
+    @Synchronized
+    fun log(line: String) {
+        if (enabled) print(CLEAR_LINE)
+        println(line)
+    }
+}
+
 // ==========================================
 // 2. CORE AGENT HARNESS LOOP
 // ==========================================
@@ -279,13 +352,21 @@ class BashAgentHarness(private val workspace: File, private val apiKey: String) 
                 trimHistory(input)
 
                 val turn = try {
+                    // The API call is the one stretch with nothing to show, and
+                    // gpt-5 can think for a minute. Say so rather than look hung.
+                    Spinner.start("Thinking")
                     callOpenAI(httpClient, input, apiKey) { interrupted }
                 } catch (e: Exception) {
+                    // Before printing, not just in the finally below: otherwise
+                    // the next spinner frame lands on the same line as the error.
+                    Spinner.stop()
                     if (interrupted) println("\n⏹️ Interrupted. Ask again to continue.")
                     // Fall back to the exception itself: a connection failure
                     // carries no message, and "API Error: null" says nothing.
                     else println("❌ API Error: ${e.message ?: e}")
                     return
+                } finally {
+                    Spinner.stop()
                 }
 
                 promptTokens += turn.promptTokens
@@ -490,7 +571,7 @@ fun callOpenAI(
         }
         val waitMs = retryDelayMs(response, attempt)
         attempt++
-        println(
+        Spinner.log(
             "⏳ %d from the API — retrying in %.1fs (attempt %d/%d)"
                 .format(Locale.ROOT, response.statusCode(), waitMs / 1000.0, attempt, MAX_RETRIES)
         )
