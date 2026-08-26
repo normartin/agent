@@ -175,10 +175,10 @@ class HarnessJobsTest : FunSpec({
 
             val quick = jobs.start("echo done", "quick")
             val killed = jobs.start("sleep 300", "killed")
-            quick.awaitFor(15_000) shouldBe true
+            quick.await(15) shouldBe true
 
             killed.stop()
-            killed.awaitFor(15_000) shouldBe true
+            killed.await(15) shouldBe true
             // A moment for the watcher, which fires the callback after it has
             // published the state.
             Thread.sleep(500)

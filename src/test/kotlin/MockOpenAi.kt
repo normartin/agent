@@ -50,10 +50,10 @@ class MockOpenAi : AutoCloseable {
 }
 
 /** A 429 whose reset header is short enough to keep the suite fast. */
-fun rateLimited(resetSeconds: String = "0.05s") = Reply(
+fun rateLimited(resetSeconds: String = "0.05") = Reply(
     status = 429,
     body = """{"error":{"message":"Rate limit reached","type":"tokens","code":"rate_limit_exceeded"}}""",
-    headers = mapOf("x-ratelimit-reset-tokens" to resetSeconds)
+    headers = mapOf("retry-after" to resetSeconds)
 )
 
 /**

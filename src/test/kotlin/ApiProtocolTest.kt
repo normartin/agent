@@ -218,7 +218,7 @@ class ApiProtocolTest : FunSpec({
 
         test("cancelling during the wait aborts instead of sleeping it out") {
             MockOpenAi().use { mock ->
-                mock.fallback = rateLimited(resetSeconds = "30s")
+                mock.fallback = rateLimited(resetSeconds = "30")
                 val started = System.currentTimeMillis()
 
                 shouldThrow<Exception> { mock.call(cancelled = { true }) }

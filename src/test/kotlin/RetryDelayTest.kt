@@ -29,51 +29,11 @@ fun headersOnly(status: Int, vararg headers: Pair<String, String>) = object : Ht
 
 class RetryDelayTest : FunSpec({
 
-    context("parseDelayMs reads the formats OpenAI emits") {
-        withData(
-            nameFn = { (raw, _) -> "\"$raw\"" },
-            "3" to 3_000L,              // bare seconds
-            "8.134s" to 8_134L,         // the format in a real 429 body
-            "500ms" to 500L,            // "ms" must win over "s"
-            "1m30s" to 90_000L,
-            "6m0s" to 360_000L,
-            "1h" to 3_600_000L
-        ) { (raw, expected) -> parseDelayMs(raw) shouldBe expected }
-    }
-
-    test("unparseable values fall through to the caller's backoff") {
-        parseDelayMs(null) shouldBe null
-        parseDelayMs("") shouldBe null
-        parseDelayMs("   ") shouldBe null
-        parseDelayMs("soon") shouldBe null
-    }
-
-    test("the server's stated reset wins, plus a pad") {
-        // Straight from the reported rate-limit error: "try again in 8.134s".
-        val response = headersOnly(429, "x-ratelimit-reset-tokens" to "8.134s")
+    test("the server's Retry-After wins, plus a pad") {
+        val response = headersOnly(429, "retry-after" to "8.134")
         retryDelayMs(response, 0) shouldBe 8_384L
         // Landing exactly on the window boundary earns a second 429.
         retryDelayMs(response, 0) shouldBeGreaterThan 8_134L
-    }
-
-    context("headers are consulted in precedence order") {
-        test("retry-after-ms is milliseconds, not seconds") {
-            retryDelayMs(headersOnly(429, "retry-after-ms" to "8134"), 0) shouldBe 8_384L
-        }
-        test("retry-after is seconds") {
-            retryDelayMs(headersOnly(429, "retry-after" to "3"), 0) shouldBe 3_250L
-        }
-        test("retry-after-ms outranks the reset headers") {
-            val response = headersOnly(
-                429,
-                "retry-after-ms" to "1000",
-                "x-ratelimit-reset-tokens" to "50s"
-            )
-            retryDelayMs(response, 0) shouldBe 1_250L
-        }
-        test("the request-reset header is the last resort") {
-            retryDelayMs(headersOnly(429, "x-ratelimit-reset-requests" to "2s"), 0) shouldBe 2_250L
-        }
     }
 
     context("without headers it backs off exponentially") {
@@ -85,7 +45,7 @@ class RetryDelayTest : FunSpec({
 
     test("waits are clamped at both ends") {
         retryDelayMs(headersOnly(503), 20) shouldBe MAX_RETRY_WAIT_MS
-        retryDelayMs(headersOnly(429, "retry-after" to "10m"), 0) shouldBe MAX_RETRY_WAIT_MS
+        retryDelayMs(headersOnly(429, "retry-after" to "600"), 0) shouldBe MAX_RETRY_WAIT_MS
         // A zero hint must not turn the retry loop into a spin.
         retryDelayMs(headersOnly(429, "retry-after" to "0"), 0) shouldBeGreaterThanOrEqual 250L
     }

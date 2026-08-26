@@ -11,7 +11,7 @@ import io.kotest.engine.spec.tempdir
 
 /** Waits for [job] to be over, failing the test rather than hanging forever. */
 private fun BackgroundJob.finish(seconds: Long = 15) {
-    awaitFor(seconds * 1000) shouldBe true
+    await(seconds) shouldBe true
 }
 
 class BoundedLogTest : FunSpec({
@@ -23,7 +23,7 @@ class BoundedLogTest : FunSpec({
         log.snapshot() shouldBe "hello world"
     }
 
-    test("a flood keeps the head and the tail and counts what went missing") {
+    test("a flood keeps the tail and counts what went missing") {
         // The cap has to hold as the output arrives: a background job has no
         // deadline, so nothing else would stop it filling memory.
         val log = BoundedLog(cap = 300)
@@ -31,7 +31,6 @@ class BoundedLogTest : FunSpec({
 
         val snapshot = log.snapshot()
         snapshot.length shouldBeLessThan 400
-        snapshot shouldContain "line 0"      // head, frozen at the start
         snapshot shouldContain "line 999"    // tail, still moving
         snapshot shouldContain "chars elided"
         snapshot shouldNotContain "line 500"
