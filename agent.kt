@@ -4,22 +4,10 @@
 //DEPS org.jetbrains.kotlin:kotlin-stdlib:2.4.10
 //DEPS org.jetbrains.kotlinx:kotlinx-serialization-json:1.7.3
 
-import kotlinx.serialization.json.Json
-import kotlinx.serialization.json.JsonArray
-import kotlinx.serialization.json.JsonObject
-import kotlinx.serialization.json.add
-import kotlinx.serialization.json.addJsonObject
-import kotlinx.serialization.json.buildJsonObject
-import kotlinx.serialization.json.contentOrNull
-import kotlinx.serialization.json.jsonArray
-import kotlinx.serialization.json.jsonObject
-import kotlinx.serialization.json.jsonPrimitive
-import kotlinx.serialization.json.longOrNull
-import kotlinx.serialization.json.put
-import kotlinx.serialization.json.putJsonArray
-import kotlinx.serialization.json.putJsonObject
+import kotlinx.serialization.json.*
 import sun.misc.Signal
 import java.io.File
+import java.io.InputStream
 import java.net.URI
 import java.net.http.HttpClient
 import java.net.http.HttpRequest
@@ -32,9 +20,9 @@ import kotlin.system.exitProcess
 
 const val MODEL = "gpt-5"
 
-// USD per 1M tokens for MODEL. These move with the model — change them together.
-// Cached input is an order of magnitude cheaper, and this loop resends the same
-// growing prefix on every iteration, so it is worth pricing separately.
+// USD per 1M tokens for MODEL — these move with the model. Cached input is an
+// order of magnitude cheaper and this loop resends the same growing prefix every
+// iteration, so it is worth pricing separately.
 const val INPUT_USD_PER_1M = 1.25
 const val CACHED_INPUT_USD_PER_1M = 0.125
 const val OUTPUT_USD_PER_1M = 10.00
@@ -42,12 +30,15 @@ const val OUTPUT_USD_PER_1M = 10.00
 const val MAX_ITERATIONS = 15
 const val TIMEOUT_SECONDS = 120L
 
+// Distinct from the bash timeout above: how long one API call may take.
+const val API_TIMEOUT_SECONDS = 120L
+
 // Every iteration resends the whole history, so tokens per minute grow with the
 // square of the turn count. Both budgets are sized against a tokens-per-minute
-// limit rather than the model's context window: at roughly 4 chars per token a
-// full history is ~30k tokens, so a MAX_ITERATIONS task stays inside gpt-5's
-// 500k TPM. Caching makes the resend cheap but not free — cached tokens are
-// still counted in full against TPM. Retune these if you change model or tier.
+// limit rather than the model's context window: at ~4 chars per token a full
+// history is ~30k tokens, so a MAX_ITERATIONS task stays inside gpt-5's 500k TPM.
+// Caching makes the resend cheap but not free — cached tokens still count in full
+// against TPM. Retune these if you change model or tier.
 const val MAX_OUTPUT_CHARS = 6000
 const val MAX_HISTORY_CHARS = 120_000
 
@@ -58,9 +49,11 @@ val API_BASE = System.getenv("OPENAI_BASE_URL")?.trimEnd('/') ?: "https://api.op
 const val MAX_RETRIES = 5
 const val MAX_RETRY_WAIT_MS = 60_000L
 
-// ==========================================
-// 1. BASH EXECUTION
-// ==========================================
+// ---------- 1. Bash execution ----------
+
+/** Reads a stream to EOF; a failed read counts as no output. */
+private fun InputStream.readTextOrEmpty() =
+    runCatching { bufferedReader().readText() }.getOrDefault("")
 
 class BashTool(
     private val workspace: File,
@@ -86,24 +79,24 @@ class BashTool(
         return try {
             val process = ProcessBuilder("bash", "-c", command)
                 .directory(workspace)
-                // Do not pass console input through to the command, otherwise an
-                // interactive command steals the chat input or blocks forever.
+                // No console input: an interactive command would otherwise steal
+                // the chat input or block forever.
                 .redirectInput(ProcessBuilder.Redirect.from(File("/dev/null")))
                 .start()
             current = process
 
             // Drain both streams on their own threads: reading them one after the
-            // other deadlocks as soon as the unread one fills its pipe buffer, and
-            // a blocking read on this thread would outlive the timeout below.
-            val out = StringBuilder()
-            val err = StringBuilder()
-            val outDrain = thread { runCatching { out.append(process.inputStream.bufferedReader().readText()) } }
-            val errDrain = thread { runCatching { err.append(process.errorStream.bufferedReader().readText()) } }
+            // other deadlocks as soon as the unread one fills its pipe buffer.
+            // The joins below are what publish these captured vars back to here.
+            var out = ""
+            var err = ""
+            val outDrain = thread { out = process.inputStream.readTextOrEmpty() }
+            val errDrain = thread { err = process.errorStream.readTextOrEmpty() }
 
             val finished = process.waitFor(timeoutSeconds, TimeUnit.SECONDS)
             if (!finished) {
-                // Kill descendants first: a surviving grandchild keeps the pipes
-                // open and the drain threads never see EOF.
+                // Descendants first: a surviving grandchild keeps the pipes open
+                // and the drain threads never see EOF.
                 process.descendants().forEach { it.destroyForcibly() }
                 process.destroyForcibly()
                 process.waitFor()
@@ -131,8 +124,8 @@ class BashTool(
 }
 
 /**
- * Caps a command's output before it enters the history. Keeps the head and the
- * tail: build failures land at the end, so dropping the tail hides the answer.
+ * Caps a command's output before it enters the history. Keeps head and tail:
+ * build failures land at the end, so dropping the tail hides the answer.
  */
 fun truncate(text: String): String {
     if (text.length <= MAX_OUTPUT_CHARS) return text
@@ -159,8 +152,7 @@ fun trimHistory(input: MutableList<JsonObject>) {
     // A function_call_output whose function_call was dropped is an orphan and a
     // guaranteed 400, so keep dropping until history resumes at an item that
     // stands on its own. Landing on a reasoning item is fine: the API only asks
-    // that the items it belongs to *follow* it, and dropping a prefix never
-    // separates a surviving reasoning item from its followers.
+    // that the items it belongs to *follow* it.
     while (drop < limit && input[drop].str("type") == "function_call_output") {
         drop++
     }
@@ -173,8 +165,8 @@ fun trimHistory(input: MutableList<JsonObject>) {
 
 /**
  * What one turn's token usage costs, in USD. The API reports cached tokens as a
- * subset of the prompt total, so the uncached remainder is what gets charged at
- * the full input rate — counting both would overstate the bill tenfold.
+ * subset of the prompt total, so only the uncached remainder bills at the full
+ * input rate — counting both would overstate the bill tenfold.
  */
 fun turnCost(input: Long, cached: Long, output: Long) =
     (input - cached) / 1_000_000.0 * INPUT_USD_PER_1M +
@@ -182,27 +174,26 @@ fun turnCost(input: Long, cached: Long, output: Long) =
         output / 1_000_000.0 * OUTPUT_USD_PER_1M
 
 /**
- * A one-line "still working" indicator for the stretch where the agent has
- * nothing to say: the API call. It paints from a daemon thread with a carriage
+ * A one-line "still working" indicator for the API call, the one stretch where
+ * the agent has nothing to say. It paints from a daemon thread with a carriage
  * return, so it overwrites itself and never scrolls anything away.
  *
- * Only a real terminal gets it. Piped output and the tests read stdout as text,
- * and control characters there are noise a caller would have to strip; the
- * check lives here so no caller needs a guard of its own.
+ * Only a real terminal gets it: piped output and the tests read stdout as text,
+ * where the escapes would be noise every caller has to strip.
  */
 object Spinner {
-    private const val FRAMES = "\u2839\u2838\u2834\u2826\u2807\u280F"
+    private const val FRAMES = "⠹⠸⠴⠦⠇⠏"
     private const val HIDE_CURSOR = "\u001B[?25l"
     private const val SHOW_CURSOR = "\u001B[?25h"
     private const val CLEAR_LINE = "\r\u001B[2K"
 
     // isTerminal(), not a null check: since JDK 22 System.console() hands back a
-    // Console even when stdout is a pipe, so the null check alone would let the
-    // escapes through to a redirected log or `./gradlew run`.
+    // Console even when stdout is a pipe, so a null check would let the escapes
+    // through to a redirected log or `./gradlew run`.
     private val enabled = System.console()?.isTerminal() == true
 
-    // Doubles as the running flag: null means "stop", which is what the worker
-    // loop reads on every frame.
+    // Doubles as the running flag: null means "stop", which the worker loop
+    // reads on every frame.
     @Volatile
     private var label: String? = null
     private var worker: Thread? = null
@@ -218,8 +209,8 @@ object Spinner {
             var frame = 0
             while (true) {
                 val current = label ?: break
-                // The elapsed count is the point: a frozen frame and a slow
-                // call look alike, a climbing clock does not.
+                // The elapsed count is the point: a frozen frame and a slow call
+                // look alike, a climbing clock does not.
                 val seconds = (System.currentTimeMillis() - startedAt) / 1000
                 print("$CLEAR_LINE${FRAMES[frame % FRAMES.length]} $current ${seconds}s")
                 System.out.flush()
@@ -233,13 +224,11 @@ object Spinner {
     @Synchronized
     fun stop() {
         label = null
-        val wasRunning = worker != null
-        worker?.join()
+        val running = worker ?: return
+        running.join()
         worker = null
-        if (wasRunning) {
-            print("$CLEAR_LINE$SHOW_CURSOR")
-            System.out.flush()
-        }
+        print("$CLEAR_LINE$SHOW_CURSOR")
+        System.out.flush()
     }
 
     /**
@@ -253,13 +242,11 @@ object Spinner {
     }
 }
 
-// ==========================================
-// 2. CORE AGENT HARNESS LOOP
-// ==========================================
+// ---------- 2. Core agent harness loop ----------
 
 /**
  * One model turn: the raw [output] items the Responses API produced, plus what
- * they cost. Cached prompt tokens are a subset of [promptTokens], and reasoning
+ * they cost. Cached prompt tokens are a subset of [promptTokens] and reasoning
  * tokens a subset of [completionTokens] — both are broken out because they are
  * priced or spent differently from the rest.
  */
@@ -377,8 +364,7 @@ class BashAgentHarness(private val workspace: File, private val apiKey: String) 
                 // Responses takes its own output straight back as input, so every
                 // item is echoed verbatim — assistant messages, function calls, and
                 // the reasoning items that keep gpt-5's thinking alive between tool
-                // calls. Chat completions needed the reply rebuilt field by field to
-                // avoid a 400; there is nothing to sanitise here.
+                // calls. Nothing here needs the sanitising chat completions did.
                 turn.output.forEach { input.add(it.jsonObject) }
 
                 val text = assistantText(turn.output)
@@ -391,41 +377,42 @@ class BashAgentHarness(private val workspace: File, private val apiKey: String) 
 
                 if (text != null) println("🤔 Reasoning: $text")
 
-                // Every call needs a reply, even the ones we skip: omitting one is a
-                // 400 on the next request.
-                for (call in calls) {
-                    // "call_id" is what a reply pairs with; "id" names the item
-                    // itself and the two are not interchangeable.
-                    val id = call.str("call_id") ?: continue
-                    // "arguments" is a JSON document carried as a string.
-                    val rawArgs = call.str("arguments") ?: ""
-                    val command = runCatching {
-                        Json.parseToJsonElement(rawArgs).jsonObject.str("command")
-                    }.getOrNull()
-
-                    val result = when {
-                        interrupted -> "[Skipped: interrupted by the user]"
-                        command.isNullOrBlank() -> "Execution Error: the tool call carried no 'command' argument (got: $rawArgs)"
-                        else -> {
-                            println("💻 Executing Bash: $command")
-                            truncate(bash.execute(command))
-                        }
-                    }
-                    println("📥 Shell Output:\n$result\n")
-
-                    input.add(
-                        buildJsonObject {
-                            put("type", "function_call_output")
-                            put("call_id", id)
-                            put("output", result)
-                        }
-                    )
-                }
+                // Every call needs a reply, even the ones we skip: omitting one is
+                // a 400 on the next request.
+                calls.forEach { call -> runCall(call)?.let(input::add) }
             }
 
             println("\n⏹️ Stopped after $MAX_ITERATIONS iterations. Ask again to continue.")
         } finally {
             busy = false
+        }
+    }
+
+    /** Runs one function_call and builds the output item that answers it. */
+    private fun runCall(call: JsonObject): JsonObject? {
+        // "call_id" is what a reply pairs with; "id" names the item itself and
+        // the two are not interchangeable.
+        val id = call.str("call_id") ?: return null
+        // "arguments" is a JSON document carried as a string.
+        val rawArgs = call.str("arguments") ?: ""
+        val command = runCatching {
+            Json.parseToJsonElement(rawArgs).jsonObject.str("command")
+        }.getOrNull()
+
+        val result = when {
+            interrupted -> "[Skipped: interrupted by the user]"
+            command.isNullOrBlank() -> "Execution Error: the tool call carried no 'command' argument (got: $rawArgs)"
+            else -> {
+                println("💻 Executing Bash: $command")
+                truncate(bash.execute(command))
+            }
+        }
+        println("📥 Shell Output:\n$result\n")
+
+        return buildJsonObject {
+            put("type", "function_call_output")
+            put("call_id", id)
+            put("output", result)
         }
     }
 
@@ -453,12 +440,15 @@ class BashAgentHarness(private val workspace: File, private val apiKey: String) 
     fun sessionCost() = turnCost(promptTokens, cachedPromptTokens, completionTokens)
 }
 
-// ==========================================
-// 3. MODERN HTTP & PRIMITIVE JSON UTILS
-// ==========================================
+// ---------- 3. HTTP and primitive JSON utils ----------
 
 /** Reads a string field, or null if it is absent or is not a string. */
 fun JsonObject.str(key: String) = this[key]?.jsonPrimitive?.contentOrNull
+
+/** Usage counters: an absent object or field reads as zero rather than throwing. */
+fun JsonObject?.long(key: String) = this?.get(key)?.jsonPrimitive?.longOrNull ?: 0L
+
+fun JsonObject?.obj(key: String) = this?.get(key) as? JsonObject
 
 /**
  * Reads the duration formats OpenAI uses in its rate-limit headers: "8.134s",
@@ -513,6 +503,22 @@ fun sleepUnlessCancelled(totalMs: Long, cancelled: () -> Boolean): Boolean {
     }
 }
 
+/** Pulls the output items and the usage counters out of a Responses reply. */
+private fun HttpResponse<String>.toTurn(): Turn {
+    val json = Json.parseToJsonElement(body()).jsonObject
+    val output = json["output"]?.jsonArray
+        ?: throw Exception("API response did not contain an 'output' array: ${body()}")
+
+    val usage = json["usage"]?.jsonObject
+    return Turn(
+        output = output,
+        promptTokens = usage.long("input_tokens"),
+        cachedPromptTokens = usage.obj("input_tokens_details").long("cached_tokens"),
+        completionTokens = usage.long("output_tokens"),
+        reasoningTokens = usage.obj("output_tokens_details").long("reasoning_tokens")
+    )
+}
+
 fun callOpenAI(
     client: HttpClient,
     input: List<JsonObject>,
@@ -526,11 +532,11 @@ fun callOpenAI(
         // No "temperature": GPT-5 is a reasoning model and does not take one.
         // Use "reasoning_effort" (low/medium/high) to trade quality for tokens.
         //
-        // "store" is left at its default of true on purpose. Reasoning items come
-        // back as bare ids that the server rehydrates, so echoing them costs a few
-        // dozen bytes instead of the encrypted blobs we would have to carry with
-        // store=false — and without them gpt-5 re-derives its thinking on every
-        // iteration. The trade is that OpenAI retains the session; /help says so.
+        // "store" is left at its default of true on purpose: reasoning items come
+        // back as bare ids the server rehydrates, so echoing them costs a few dozen
+        // bytes instead of the encrypted blobs store=false would force us to carry
+        // — and without them gpt-5 re-derives its thinking every iteration. The
+        // trade is that OpenAI retains the session; /help says so.
         putJsonArray("tools") {
             addJsonObject {
                 // Responses flattens the tool schema: name, description and
@@ -554,7 +560,7 @@ fun callOpenAI(
 
     val request = HttpRequest.newBuilder()
         .uri(URI.create("$baseUrl/v1/responses"))
-        .timeout(Duration.ofSeconds(120))
+        .timeout(Duration.ofSeconds(API_TIMEOUT_SECONDS))
         .header("Authorization", "Bearer $apiKey")
         .header("Content-Type", "application/json")
         .POST(HttpRequest.BodyPublishers.ofString(payload))
@@ -564,48 +570,27 @@ fun callOpenAI(
     // loop resends its whole history every iteration, so a busy task can spend a
     // minute's token allowance on itself. Wait it out rather than lose the task.
     var attempt = 0
-    var response = client.send(request, HttpResponse.BodyHandlers.ofString())
-    while (response.statusCode() == 429 || response.statusCode() >= 500) {
-        if (attempt >= MAX_RETRIES) {
-            throw Exception("API Error [Status ${response.statusCode()}] after $MAX_RETRIES retries: ${response.body()}")
+    while (true) {
+        val response = client.send(request, HttpResponse.BodyHandlers.ofString())
+        val status = response.statusCode()
+        if (status == 200) return response.toTurn()
+        if (status != 429 && status < 500) {
+            throw Exception("API Error [Status $status]: ${response.body()}")
         }
-        val waitMs = retryDelayMs(response, attempt)
-        attempt++
+        if (attempt >= MAX_RETRIES) {
+            throw Exception("API Error [Status $status] after $MAX_RETRIES retries: ${response.body()}")
+        }
+
+        val waitMs = retryDelayMs(response, attempt++)
         Spinner.log(
             "⏳ %d from the API — retrying in %.1fs (attempt %d/%d)"
-                .format(Locale.ROOT, response.statusCode(), waitMs / 1000.0, attempt, MAX_RETRIES)
+                .format(Locale.ROOT, status, waitMs / 1000.0, attempt, MAX_RETRIES)
         )
         if (!sleepUnlessCancelled(waitMs, cancelled)) throw Exception("Cancelled while waiting out a rate limit.")
-        response = client.send(request, HttpResponse.BodyHandlers.ofString())
     }
-
-    if (response.statusCode() != 200) {
-        throw Exception("API Error [Status ${response.statusCode()}]: ${response.body()}")
-    }
-
-    val body = Json.parseToJsonElement(response.body()).jsonObject
-    val output = body["output"]?.jsonArray
-        ?: throw Exception("API response did not contain an 'output' array: ${response.body()}")
-
-    val usage = body["usage"]?.jsonObject
-    fun count(vararg path: String): Long {
-        var node: JsonObject? = usage
-        for (key in path.dropLast(1)) node = node?.get(key) as? JsonObject
-        return node?.get(path.last())?.jsonPrimitive?.longOrNull ?: 0L
-    }
-
-    return Turn(
-        output = output,
-        promptTokens = count("input_tokens"),
-        cachedPromptTokens = count("input_tokens_details", "cached_tokens"),
-        completionTokens = count("output_tokens"),
-        reasoningTokens = count("output_tokens_details", "reasoning_tokens")
-    )
 }
 
-// ==========================================
-// 4. MAIN ENTRY POINT (INTERACTIVE CONSOLE)
-// ==========================================
+// ---------- 4. Main entry point (interactive console) ----------
 
 fun printHelp() {
     println(
@@ -632,6 +617,7 @@ fun main() {
 
     val workspace = File(".").apply { mkdirs() }.canonicalFile
     val harness = BashAgentHarness(workspace, apiKey)
+    fun farewell() = println("\n👋 Bye! Session cost: \$%.4f".format(Locale.ROOT, harness.sessionCost()))
 
     // Ctrl+C cancels the running task instead of killing the JVM. At the idle
     // prompt it still quits, which is what a console user expects.
@@ -639,7 +625,7 @@ fun main() {
         if (harness.busy) {
             harness.interrupt()
         } else {
-            println("\n👋 Bye! Session cost: \$%.4f".format(Locale.ROOT, harness.sessionCost()))
+            farewell()
             exitProcess(0)
         }
     }
@@ -656,20 +642,17 @@ fun main() {
 
         when (input.lowercase()) {
             "/exit", "/quit" -> break
-            "/help" -> {
-                printHelp()
-                continue
-            }
+            "/help" -> printHelp()
             "/reset" -> {
                 harness.reset()
                 println("🧹 History cleared.")
-                continue
+            }
+            else -> {
+                println()
+                harness.runTask(input)
             }
         }
-
-        println()
-        harness.runTask(input)
     }
 
-    println("\n👋 Bye! Session cost: \$%.4f".format(Locale.ROOT, harness.sessionCost()))
+    farewell()
 }
