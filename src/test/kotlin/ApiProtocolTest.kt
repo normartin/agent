@@ -38,16 +38,20 @@ class ApiProtocolTest : FunSpec({
             }
         }
 
-        test("declares exactly one bash function tool") {
+        test("declares exactly one bash function tool, flat") {
             MockOpenAi().use { mock ->
                 mock.call()
                 val tools = mock.requests.single().json()["tools"]!!.jsonArray
                 tools.size shouldBe 1
 
-                val function = tools.single().jsonObject["function"]!!.jsonObject
-                function["name"]!!.jsonPrimitive.content shouldBe "bash"
+                // Responses puts name/description/parameters on the tool itself.
+                // The chat-completions "function" wrapper is a 400 here.
+                val tool = tools.single().jsonObject
+                tool["function"] shouldBe null
+                tool["type"]!!.jsonPrimitive.content shouldBe "function"
+                tool["name"]!!.jsonPrimitive.content shouldBe "bash"
 
-                val parameters = function["parameters"]!!.jsonObject
+                val parameters = tool["parameters"]!!.jsonObject
                 val command = parameters["properties"]!!.jsonObject["command"]!!.jsonObject
                 command["type"]!!.jsonPrimitive.content shouldBe "string"
                 parameters["required"]!!.jsonArray
@@ -64,38 +68,69 @@ class ApiProtocolTest : FunSpec({
             }
         }
 
-        test("passes the message history through unchanged") {
+        test("leaves store at its default so reasoning ids stay resolvable") {
+            // Sending store=false would strand the bare reasoning ids the harness
+            // echoes back, and gpt-5 would re-derive its thinking every iteration.
             MockOpenAi().use { mock ->
                 mock.call()
-                val messages = mock.requests.single().json()["messages"]!!.jsonArray
-                messages.size shouldBe 2
-                messages.last().jsonObject["content"]!!.jsonPrimitive.content shouldBe "list the files"
+                mock.requests.single().json()["store"] shouldBe null
+            }
+        }
+
+        test("passes the history through as input, unchanged") {
+            MockOpenAi().use { mock ->
+                mock.call()
+                val request = mock.requests.single().json()
+                request["messages"] shouldBe null
+
+                val input = request["input"]!!.jsonArray
+                input.size shouldBe 2
+                input.first().jsonObject["role"]!!.jsonPrimitive.content shouldBe "system"
+                input.last().jsonObject["content"]!!.jsonPrimitive.content shouldBe "list the files"
             }
         }
     }
 
     context("the response the harness parses") {
 
-        test("a tool call arrives intact") {
+        test("a function call arrives intact") {
             MockOpenAi().use { mock ->
                 mock.script(Reply(200, toolCallBody(command = "echo hi")))
                 val turn = mock.call()
 
-                val call = turn.message["tool_calls"]!!.jsonArray.single().jsonObject
-                call["id"]!!.jsonPrimitive.content shouldBe "call_abc123"
+                val call = turn.output.map { it.jsonObject }
+                    .single { it.str("type") == "function_call" }
+                // "call_id" is what a function_call_output pairs with, not "id".
+                call.str("call_id") shouldBe "call_abc123"
+                call.str("id") shouldBe "fc_abc123"
 
-                val arguments = call["function"]!!.jsonObject["arguments"]!!.jsonPrimitive.content
-                Json.parseToJsonElement(arguments).jsonObject["command"]!!
-                    .jsonPrimitive.content shouldBe "echo hi"
+                Json.parseToJsonElement(call.str("arguments")!!)
+                    .jsonObject.str("command") shouldBe "echo hi"
             }
         }
 
-        test("a final answer arrives as content with no tool calls") {
+        test("reasoning items survive so the loop can echo them back") {
+            MockOpenAi().use { mock ->
+                mock.script(Reply(200, toolCallBody()))
+                val turn = mock.call()
+                turn.output.map { it.jsonObject.str("type") } shouldBe
+                    listOf("reasoning", "function_call")
+            }
+        }
+
+        test("a final answer arrives as message text with no function call") {
             MockOpenAi().use { mock ->
                 mock.script(Reply(200, finalAnswerBody("all done")))
                 val turn = mock.call()
-                turn.message["content"]!!.jsonPrimitive.content shouldBe "all done"
-                turn.message["tool_calls"] shouldBe null
+                assistantText(turn.output) shouldBe "all done"
+                turn.output.map { it.jsonObject.str("type") } shouldBe listOf("message")
+            }
+        }
+
+        test("a turn that only calls a tool has no assistant text") {
+            MockOpenAi().use { mock ->
+                mock.script(Reply(200, toolCallBody()))
+                assistantText(mock.call().output) shouldBe null
             }
         }
 
@@ -112,18 +147,18 @@ class ApiProtocolTest : FunSpec({
 
         test("missing usage counts as zero rather than throwing") {
             MockOpenAi().use { mock ->
-                mock.script(Reply(200, """{"choices":[{"message":{"role":"assistant","content":"hi"}}]}"""))
+                mock.script(Reply(200, """{"output":[]}"""))
                 val turn = mock.call()
                 turn.promptTokens shouldBe 0L
                 turn.cachedPromptTokens shouldBe 0L
             }
         }
 
-        test("a response with no message is an error, not a crash") {
+        test("a response with no output array is an error, not a crash") {
             MockOpenAi().use { mock ->
-                mock.script(Reply(200, """{"choices":[]}"""))
+                mock.script(Reply(200, """{"id":"resp_1","status":"completed"}"""))
                 shouldThrow<Exception> { mock.call() }
-                    .message.shouldNotBeNull() shouldContain "did not contain choices[0].message"
+                    .message.shouldNotBeNull() shouldContain "did not contain an 'output' array"
             }
         }
     }
@@ -133,7 +168,7 @@ class ApiProtocolTest : FunSpec({
         test("a rate limit is waited out and the call succeeds") {
             MockOpenAi().use { mock ->
                 mock.script(rateLimited(), Reply(200, finalAnswerBody("recovered")))
-                mock.call().message["content"]!!.jsonPrimitive.content shouldBe "recovered"
+                assistantText(mock.call().output) shouldBe "recovered"
                 mock.requests.size shouldBe 2
             }
         }
@@ -141,7 +176,7 @@ class ApiProtocolTest : FunSpec({
         test("a server error is retried too") {
             MockOpenAi().use { mock ->
                 mock.script(Reply(503, "upstream boom"), Reply(200, finalAnswerBody("recovered")))
-                mock.call().message["content"]!!.jsonPrimitive.content shouldBe "recovered"
+                assistantText(mock.call().output) shouldBe "recovered"
                 mock.requests.size shouldBe 2
             }
         }

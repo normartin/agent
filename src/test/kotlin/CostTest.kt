@@ -57,14 +57,14 @@ class CostTest : FunSpec({
 
     test("usage details are read from the nested objects the API returns") {
         val usage = Json.parseToJsonElement(
-            """{"prompt_tokens":1000,"completion_tokens":200,
-                "prompt_tokens_details":{"cached_tokens":768},
-                "completion_tokens_details":{"reasoning_tokens":128}}"""
+            """{"input_tokens":1000,"output_tokens":200,
+                "input_tokens_details":{"cached_tokens":768},
+                "output_tokens_details":{"reasoning_tokens":128}}"""
         ).jsonObject
 
-        usage["prompt_tokens_details"]?.jsonObject?.get("cached_tokens")
+        usage["input_tokens_details"]?.jsonObject?.get("cached_tokens")
             ?.jsonPrimitive?.longOrNull shouldBe 768L
-        usage["completion_tokens_details"]?.jsonObject?.get("reasoning_tokens")
+        usage["output_tokens_details"]?.jsonObject?.get("reasoning_tokens")
             ?.jsonPrimitive?.longOrNull shouldBe 128L
     }
 })

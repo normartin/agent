@@ -143,28 +143,30 @@ fun truncate(text: String): String {
 
 /**
  * Drops the oldest turns once the history outgrows its budget. The system
- * prompt and the most recent message always survive.
+ * prompt and the most recent item always survive.
  */
-fun trimHistory(messages: MutableList<JsonObject>) {
-    var total = messages.sumOf { it.toString().length }
+fun trimHistory(input: MutableList<JsonObject>) {
+    var total = input.sumOf { it.toString().length }
     if (total <= MAX_HISTORY_CHARS) return
 
-    val limit = messages.size - 1
+    val limit = input.size - 1
     var drop = 1
     while (drop < limit && total > MAX_HISTORY_CHARS) {
-        total -= messages[drop].toString().length
+        total -= input[drop].toString().length
         drop++
     }
-    // A tool reply whose assistant tool_calls message was dropped is an
-    // orphan and a guaranteed 400, so keep dropping until history resumes
-    // at a message that stands on its own.
-    while (drop < limit && messages[drop]["role"]?.jsonPrimitive?.contentOrNull == "tool") {
+    // A function_call_output whose function_call was dropped is an orphan and a
+    // guaranteed 400, so keep dropping until history resumes at an item that
+    // stands on its own. Landing on a reasoning item is fine: the API only asks
+    // that the items it belongs to *follow* it, and dropping a prefix never
+    // separates a surviving reasoning item from its followers.
+    while (drop < limit && input[drop].str("type") == "function_call_output") {
         drop++
     }
 
     if (drop > 1) {
-        messages.subList(1, drop).clear()
-        println("🧹 Trimmed ${drop - 1} old message(s) to stay inside the context budget.")
+        input.subList(1, drop).clear()
+        println("🧹 Trimmed ${drop - 1} old item(s) to stay inside the context budget.")
     }
 }
 
@@ -183,21 +185,35 @@ fun turnCost(input: Long, cached: Long, output: Long) =
 // ==========================================
 
 /**
- * One model turn. Cached prompt tokens are a subset of [promptTokens], and
- * reasoning tokens a subset of [completionTokens] — both are broken out because
- * they are priced or spent differently from the rest.
+ * One model turn: the raw [output] items the Responses API produced, plus what
+ * they cost. Cached prompt tokens are a subset of [promptTokens], and reasoning
+ * tokens a subset of [completionTokens] — both are broken out because they are
+ * priced or spent differently from the rest.
  */
 data class Turn(
-    val message: JsonObject,
+    val output: JsonArray,
     val promptTokens: Long,
     val cachedPromptTokens: Long,
     val completionTokens: Long,
     val reasoningTokens: Long
 )
 
+/**
+ * The assistant's prose for a turn. Responses spreads it over "message" items
+ * whose content is a list of parts, so it has to be gathered rather than read
+ * off a single field.
+ */
+fun assistantText(output: JsonArray): String? = output
+    .map { it.jsonObject }
+    .filter { it.str("type") == "message" }
+    .flatMap { it["content"]?.jsonArray.orEmpty() }
+    .mapNotNull { it.jsonObject.str("text") }
+    .joinToString("\n")
+    .takeUnless { it.isBlank() }
+
 class BashAgentHarness(private val workspace: File, private val apiKey: String) {
     private val bash = BashTool(workspace)
-    private val messages = mutableListOf<JsonObject>()
+    private val input = mutableListOf<JsonObject>()
     private val httpClient = HttpClient.newBuilder()
         .connectTimeout(Duration.ofSeconds(10))
         .build()
@@ -235,8 +251,8 @@ class BashAgentHarness(private val workspace: File, private val apiKey: String) 
 
     /** Drops the conversation history and starts over with the system prompt. */
     fun reset() {
-        messages.clear()
-        messages.add(message("system", systemPrompt))
+        input.clear()
+        input.add(message("system", systemPrompt))
         interrupted = false
     }
 
@@ -250,7 +266,7 @@ class BashAgentHarness(private val workspace: File, private val apiKey: String) 
         interrupted = false
         busy = true
         try {
-            messages.add(message("user", taskDescription))
+            input.add(message("user", taskDescription))
 
             var iterations = 0
             while (iterations < MAX_ITERATIONS) {
@@ -260,10 +276,10 @@ class BashAgentHarness(private val workspace: File, private val apiKey: String) 
                     println("\n⏹️ Interrupted. Ask again to continue.")
                     return
                 }
-                trimHistory(messages)
+                trimHistory(input)
 
                 val turn = try {
-                    callOpenAI(httpClient, messages, apiKey) { interrupted }
+                    callOpenAI(httpClient, input, apiKey) { interrupted }
                 } catch (e: Exception) {
                     if (interrupted) println("\n⏹️ Interrupted. Ask again to continue.")
                     // Fall back to the exception itself: a connection failure
@@ -277,40 +293,36 @@ class BashAgentHarness(private val workspace: File, private val apiKey: String) 
                 completionTokens += turn.completionTokens
                 printUsage(turn)
 
-                val content = turn.message["content"]?.jsonPrimitive?.contentOrNull?.takeUnless { it.isBlank() }
-                // An empty tool_calls array is rejected on the next request, so
-                // treat it as no call at all.
-                val toolCalls = turn.message["tool_calls"]?.jsonArray?.takeUnless { it.isEmpty() }
+                // Responses takes its own output straight back as input, so every
+                // item is echoed verbatim — assistant messages, function calls, and
+                // the reasoning items that keep gpt-5's thinking alive between tool
+                // calls. Chat completions needed the reply rebuilt field by field to
+                // avoid a 400; there is nothing to sanitise here.
+                turn.output.forEach { input.add(it.jsonObject) }
 
-                // Echo back only the fields the API expects. The raw message also
-                // carries refusal/annotations, which can come back as a 400.
-                messages.add(
-                    buildJsonObject {
-                        put("role", "assistant")
-                        if (content != null) put("content", content)
-                        if (toolCalls != null) put("tool_calls", toolCalls)
-                    }
-                )
+                val text = assistantText(turn.output)
+                val calls = turn.output.map { it.jsonObject }.filter { it.str("type") == "function_call" }
 
-                if (toolCalls == null) {
-                    println("\n✅ ${content ?: "(the model returned neither an answer nor a command)"}")
+                if (calls.isEmpty()) {
+                    println("\n✅ ${text ?: "(the model returned neither an answer nor a command)"}")
                     return
                 }
 
-                if (content != null) println("🤔 Reasoning: $content")
+                if (text != null) println("🤔 Reasoning: $text")
 
-                // Every tool call needs a reply, even the ones we skip: omitting
-                // one is a 400 on the next request.
-                for (call in toolCalls) {
-                    val obj = call.jsonObject
-                    val id = obj["id"]?.jsonPrimitive?.contentOrNull ?: continue
+                // Every call needs a reply, even the ones we skip: omitting one is a
+                // 400 on the next request.
+                for (call in calls) {
+                    // "call_id" is what a reply pairs with; "id" names the item
+                    // itself and the two are not interchangeable.
+                    val id = call.str("call_id") ?: continue
                     // "arguments" is a JSON document carried as a string.
-                    val rawArgs = obj["function"]?.jsonObject?.get("arguments")?.jsonPrimitive?.contentOrNull ?: ""
+                    val rawArgs = call.str("arguments") ?: ""
                     val command = runCatching {
-                        Json.parseToJsonElement(rawArgs).jsonObject["command"]?.jsonPrimitive?.contentOrNull
+                        Json.parseToJsonElement(rawArgs).jsonObject.str("command")
                     }.getOrNull()
 
-                    val output = when {
+                    val result = when {
                         interrupted -> "[Skipped: interrupted by the user]"
                         command.isNullOrBlank() -> "Execution Error: the tool call carried no 'command' argument (got: $rawArgs)"
                         else -> {
@@ -318,13 +330,13 @@ class BashAgentHarness(private val workspace: File, private val apiKey: String) 
                             truncate(bash.execute(command))
                         }
                     }
-                    println("📥 Shell Output:\n$output\n")
+                    println("📥 Shell Output:\n$result\n")
 
-                    messages.add(
+                    input.add(
                         buildJsonObject {
-                            put("role", "tool")
-                            put("tool_call_id", id)
-                            put("content", output)
+                            put("type", "function_call_output")
+                            put("call_id", id)
+                            put("output", result)
                         }
                     )
                 }
@@ -363,6 +375,9 @@ class BashAgentHarness(private val workspace: File, private val apiKey: String) 
 // ==========================================
 // 3. MODERN HTTP & PRIMITIVE JSON UTILS
 // ==========================================
+
+/** Reads a string field, or null if it is absent or is not a string. */
+fun JsonObject.str(key: String) = this[key]?.jsonPrimitive?.contentOrNull
 
 /**
  * Reads the duration formats OpenAI uses in its rate-limit headers: "8.134s",
@@ -419,39 +434,45 @@ fun sleepUnlessCancelled(totalMs: Long, cancelled: () -> Boolean): Boolean {
 
 fun callOpenAI(
     client: HttpClient,
-    messages: List<JsonObject>,
+    input: List<JsonObject>,
     apiKey: String,
     baseUrl: String = API_BASE,
     cancelled: () -> Boolean = { false }
 ): Turn {
     val payload = buildJsonObject {
         put("model", MODEL)
-        put("messages", JsonArray(messages))
+        put("input", JsonArray(input))
         // No "temperature": GPT-5 is a reasoning model and does not take one.
         // Use "reasoning_effort" (low/medium/high) to trade quality for tokens.
+        //
+        // "store" is left at its default of true on purpose. Reasoning items come
+        // back as bare ids that the server rehydrates, so echoing them costs a few
+        // dozen bytes instead of the encrypted blobs we would have to carry with
+        // store=false — and without them gpt-5 re-derives its thinking on every
+        // iteration. The trade is that OpenAI retains the session; /help says so.
         putJsonArray("tools") {
             addJsonObject {
+                // Responses flattens the tool schema: name, description and
+                // parameters sit on the tool itself, with no "function" wrapper.
                 put("type", "function")
-                putJsonObject("function") {
-                    put("name", "bash")
-                    put("description", "Run a shell command in the workspace and return its stdout, stderr and exit code.")
-                    putJsonObject("parameters") {
-                        put("type", "object")
-                        putJsonObject("properties") {
-                            putJsonObject("command") {
-                                put("type", "string")
-                                put("description", "The exact shell command to run.")
-                            }
+                put("name", "bash")
+                put("description", "Run a shell command in the workspace and return its stdout, stderr and exit code.")
+                putJsonObject("parameters") {
+                    put("type", "object")
+                    putJsonObject("properties") {
+                        putJsonObject("command") {
+                            put("type", "string")
+                            put("description", "The exact shell command to run.")
                         }
-                        putJsonArray("required") { add("command") }
                     }
+                    putJsonArray("required") { add("command") }
                 }
             }
         }
     }.toString()
 
     val request = HttpRequest.newBuilder()
-        .uri(URI.create("$baseUrl/v1/chat/completions"))
+        .uri(URI.create("$baseUrl/v1/responses"))
         .timeout(Duration.ofSeconds(120))
         .header("Authorization", "Bearer $apiKey")
         .header("Content-Type", "application/json")
@@ -482,13 +503,8 @@ fun callOpenAI(
     }
 
     val body = Json.parseToJsonElement(response.body()).jsonObject
-    val message = body["choices"]
-        ?.jsonArray
-        ?.firstOrNull()
-        ?.jsonObject
-        ?.get("message")
-        ?.jsonObject
-        ?: throw Exception("API response did not contain choices[0].message: ${response.body()}")
+    val output = body["output"]?.jsonArray
+        ?: throw Exception("API response did not contain an 'output' array: ${response.body()}")
 
     val usage = body["usage"]?.jsonObject
     fun count(vararg path: String): Long {
@@ -498,11 +514,11 @@ fun callOpenAI(
     }
 
     return Turn(
-        message = message,
-        promptTokens = count("prompt_tokens"),
-        cachedPromptTokens = count("prompt_tokens_details", "cached_tokens"),
-        completionTokens = count("completion_tokens"),
-        reasoningTokens = count("completion_tokens_details", "reasoning_tokens")
+        output = output,
+        promptTokens = count("input_tokens"),
+        cachedPromptTokens = count("input_tokens_details", "cached_tokens"),
+        completionTokens = count("output_tokens"),
+        reasoningTokens = count("output_tokens_details", "reasoning_tokens")
     )
 }
 
@@ -519,6 +535,9 @@ fun printHelp() {
           /exit    Quit (or Ctrl+D)
         Ctrl+C cancels the running task; at the prompt it quits.
         Anything else is sent to the agent as a task.
+
+        Note: requests are sent with store=true, so OpenAI retains this session
+        — the commands run and their output included — for about 30 days.
         """.trimIndent()
     )
 }
@@ -530,7 +549,7 @@ fun main() {
         return
     }
 
-    val workspace = File("./agent_workspace").apply { mkdirs() }.canonicalFile
+    val workspace = File(".").apply { mkdirs() }.canonicalFile
     val harness = BashAgentHarness(workspace, apiKey)
 
     // Ctrl+C cancels the running task instead of killing the JVM. At the idle
