@@ -38,7 +38,7 @@ const val INPUT_USD_PER_1M = 1.75
 const val CACHED_INPUT_USD_PER_1M = 0.175
 const val OUTPUT_USD_PER_1M = 14.00
 
-const val MAX_ITERATIONS = 15
+const val MAX_ITERATIONS = 25
 const val TIMEOUT_SECONDS = 120L       // foreground command deadline
 // One API call. Generous because a medium think over a big tool result runs minutes, and the request
 // in flight cannot be cancelled: Ctrl+C is felt between iterations and in the retry sleep only.
