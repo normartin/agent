@@ -50,6 +50,14 @@ const val MAX_WAIT_SECONDS = 600L
 const val MAX_AGENT_DEPTH = 2
 val AGENT_DEPTH = System.getenv("AGENT_DEPTH")?.toIntOrNull() ?: 0
 
+// Project instructions, read from the working directory once at startup and folded into the system
+// prompt. They belong in item 0: read once, they are stable turn to turn, so the prompt cache keeps
+// paying for them, whereas a per-turn message would push them behind the moving history.
+val INSTRUCTION_FILES = listOf("CLAUDE.md", "AGENTS.md")
+// Per-file cap: the prompt is resent every iteration and counts against tokens-per-minute, cached or
+// not (see MAX_HISTORY_CHARS), and a runaway file must not eat the budget the conversation needs.
+const val MAX_INSTRUCTIONS_CHARS = 20_000
+
 // Sized against tokens-per-minute, not the context window: the whole history is
 // resent every iteration and cached tokens still count against TPM.
 const val MAX_OUTPUT_CHARS = 6000
@@ -70,7 +78,12 @@ val PROMPT_CACHE_KEY = "agent-" + java.util.UUID.randomUUID()
 // ---------- 1. What the model sees: system prompt and tool schema ----------
 
 /** What the model is told at item 0 of every request. Stable by design: the prompt cache keys on it. */
-fun systemPrompt(workspace: File, depth: Int = AGENT_DEPTH, subAgentCommand: String? = selfCommand()): String = """
+fun systemPrompt(
+    workspace: File,
+    depth: Int = AGENT_DEPTH,
+    subAgentCommand: String? = selfCommand(),
+    instructions: String = projectInstructions(workspace)
+): String = """
     You are a coding agent with a local bash shell via the "bash" tool. Working directory: ${workspace.absolutePath}
     Commands already run there; no need to cd into it.
     You are in an ongoing console conversation; keep earlier turns in mind. When the request is done, answer and stop.
@@ -86,7 +99,27 @@ fun systemPrompt(workspace: File, depth: Int = AGENT_DEPTH, subAgentCommand: Str
     user turn is preceded by a [background jobs still running] listing. Use "wait" only when you need the
     result to answer. A finished job may hand you a turn without user input: report it and stop; fix it only
     if it failed. Background jobs survive an interrupted task and die with the session.
-""".trimIndent() + subAgentPrompt(depth, subAgentCommand)
+""".trimIndent() + subAgentPrompt(depth, subAgentCommand) + instructionsPrompt(instructions)
+
+/** Last in the prompt, so the harness text ahead of it is the same in every project. */
+fun instructionsPrompt(instructions: String): String =
+    if (instructions.isBlank()) ""
+    else "\n\nProject instructions, read from the working directory at startup. Follow them:\n\n$instructions"
+
+/** The instruction files present in [workspace], in [INSTRUCTION_FILES] order. */
+fun instructionFiles(workspace: File): List<File> =
+    INSTRUCTION_FILES.map { File(workspace, it) }.filter { it.isFile }
+
+/**
+ * The instruction files as one block, each under a "## name" heading so the model can tell them
+ * apart, capped per file. An unreadable file is skipped: a permissions quirk in a checkout must not
+ * stop the agent from starting.
+ */
+fun projectInstructions(workspace: File): String =
+    instructionFiles(workspace).mapNotNull { file ->
+        val text = runCatching { file.readText() }.getOrNull()?.trim() ?: return@mapNotNull null
+        if (text.isEmpty()) null else "## ${file.name}\n" + truncate(text, MAX_INSTRUCTIONS_CHARS)
+    }.joinToString("\n\n")
 
 /** Empty at the depth cap, so a child at the bottom of the chain is never shown the idea. */
 fun subAgentPrompt(depth: Int, command: String?): String {
@@ -212,6 +245,7 @@ class BashAgentHarness(
             put("workspace", workspace.absolutePath)
             put("prompt_cache_key", PROMPT_CACHE_KEY)
             put("system_prompt", systemPrompt)
+            putJsonArray("instruction_files") { instructionFiles(workspace).forEach { add(it.name) } }
         }
     }
 
@@ -520,6 +554,7 @@ private fun runOneShot(workspace: File, apiKey: String, log: JsonlLog?) {
     val harness = BashAgentHarness(workspace, apiKey, log = log)
     Runtime.getRuntime().addShutdownHook(thread(start = false) { harness.shutdown() })
     Signal.handle(Signal("INT")) { harness.interrupt() }
+    instructionsNotice(workspace)?.let { System.err.println(it) }
 
     val answer = harness.runTask(prompt)
     System.err.println("Session cost: \$%.4f".format(Locale.ROOT, harness.sessionCost()))
@@ -553,6 +588,7 @@ private fun runConsole(workspace: File, apiKey: String, log: JsonlLog?) {
     }
 
     println("🤖 Bash Agent — Workspace: ${workspace.absolutePath}")
+    instructionsNotice(workspace)?.let { println(it) }
     printHelp()
 
     // readLine() paints the prompt while it runs, so it may only be active while we are actually
@@ -619,11 +655,15 @@ fun selfCommand(): String? {
     return (listOf(command) + args).joinToString(" ") { "'" + it.replace("'", "'\\''") + "'" }
 }
 
+/** One line naming the instruction files that went into the prompt, or null when there are none. */
+fun instructionsNotice(workspace: File): String? =
+    instructionFiles(workspace).takeIf { it.isNotEmpty() }?.let { "📄 Instructions: " + it.joinToString(", ") { f -> f.name } }
+
 /** Caps output, keeping head and tail: build failures land at the end. */
-fun truncate(text: String): String {
-    if (text.length <= MAX_OUTPUT_CHARS) return text
-    val head = text.take(MAX_OUTPUT_CHARS * 2 / 3)
-    val tail = text.takeLast(MAX_OUTPUT_CHARS / 3)
+fun truncate(text: String, limit: Int = MAX_OUTPUT_CHARS): String {
+    if (text.length <= limit) return text
+    val head = text.take(limit * 2 / 3)
+    val tail = text.takeLast(limit / 3)
     return "$head\n… [${text.length - head.length - tail.length} chars elided] …\n$tail"
 }
 
