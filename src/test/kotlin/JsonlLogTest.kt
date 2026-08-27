@@ -48,7 +48,8 @@ class JsonlLogTest : FunSpec({
     }
 
     test("resolveLogPath uses a session timestamp when AGENT_LOG is unset") {
-        resolveLogPath(null, Instant.parse("2026-01-02T03:04:05Z")) shouldBe "agent-20260102-030405Z.jsonl"
+        val zone = java.time.ZoneId.of("Europe/Copenhagen")
+        resolveLogPath(null, Instant.parse("2026-01-02T03:04:05Z"), zone) shouldBe "agent-20260102-040405.jsonl"
     }
 
     test("resolveLogPath keeps explicit values and treats blank as off") {

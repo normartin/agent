@@ -20,7 +20,7 @@ import java.net.http.HttpRequest
 import java.net.http.HttpResponse
 import java.time.Duration
 import java.time.Instant
-import java.time.ZoneOffset
+import java.time.ZoneId
 import java.time.format.DateTimeFormatter.ofPattern
 import java.util.Locale
 import java.util.concurrent.LinkedBlockingQueue
@@ -541,8 +541,9 @@ fun main() {
 }
 
 /** AGENT_LOG: unset -> one file per session, blank -> off, otherwise the given path. */
-fun resolveLogPath(env: String?, now: Instant = Instant.now()): String? = when {
-    env == null -> "agent-${ofPattern("yyyyMMdd-HHmmss").withZone(ZoneOffset.UTC).format(now)}Z.jsonl"
+// Local zone: the name is for humans finding "the session from this morning".
+fun resolveLogPath(env: String?, now: Instant = Instant.now(), zone: ZoneId = ZoneId.systemDefault()): String? = when {
+    env == null -> "agent-${ofPattern("yyyyMMdd-HHmmss").withZone(zone).format(now)}.jsonl"
     env.isBlank() -> null
     else -> env
 }
