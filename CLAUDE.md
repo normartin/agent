@@ -25,8 +25,8 @@ shell through OpenAI Responses API (`/v1/responses`) tool calls.
   system prompt (each capped at `MAX_INSTRUCTIONS_CHARS`, head and tail kept). They go in item 0 on
   purpose: read once, they are stable turn to turn, so the prompt cache keeps covering them. The
   startup banner lists which were loaded; the `session` log event records them too.
-- `AGENT_CMD` overrides how a sub-agent is launched (default: rebuilt from our
-  own argv). `AGENT_DEPTH` is set on every job the agent starts; past
+- `AGENT_CMD` overrides how a sub-agent is launched (default: `./agent.kt`, the
+  JBang script in the cwd). `AGENT_DEPTH` is set on every job the agent starts; past
   `MAX_AGENT_DEPTH` the prompt stops offering sub-agents and `main` refuses to run.
 - `echo "prompt" | ./agent.kt` — one-shot mode: when stdin is not a terminal the
   whole of stdin is the prompt, the answer goes to stdout, progress to stderr,

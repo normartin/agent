@@ -651,17 +651,11 @@ private fun runConsole(workspace: File, apiKey: String, log: JsonlLog?) {
 // ---------- 4. Command execution and background jobs ----------
 
 /**
- * How to launch this very program again, for sub-agents. AGENT_CMD wins; otherwise it is rebuilt
- * from our own argv, which works for both the JBang script and the Gradle-installed launcher.
- * Null when neither is known, in which case the model is simply not offered sub-agents.
+ * How to launch this very program again, for sub-agents. AGENT_CMD wins; otherwise the local
+ * JBang script path is enough in this repo and keeps the prompt short and stable.
  */
-fun selfCommand(): String? {
-    System.getenv("AGENT_CMD")?.takeIf { it.isNotBlank() }?.let { return it }
-    val info = ProcessHandle.current().info()
-    val command = info.command().orElse(null) ?: return null
-    val args = info.arguments().orElse(null) ?: return null
-    return (listOf(command) + args).joinToString(" ") { "'" + it.replace("'", "'\\''") + "'" }
-}
+fun selfCommand(): String? =
+    System.getenv("AGENT_CMD")?.takeIf { it.isNotBlank() } ?: "./agent.kt"
 
 /** One line naming the instruction files that went into the prompt, or null when there are none. */
 fun instructionsNotice(workspace: File): String? =
