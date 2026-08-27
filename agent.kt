@@ -643,11 +643,11 @@ fun availableTools(names: List<String> = listOf("rg", "jq", "python3", "curl", "
 fun instructionsNotice(workspace: File): String? =
     instructionFiles(workspace).takeIf { it.isNotEmpty() }?.let { "📄 Instructions: " + it.joinToString(", ") { f -> f.name } }
 
-/** Last few lines for the console, so long results don't drown the prompt. */
+/** Last few lines for the console, indented so output stands apart from the prompt. */
 fun tailForConsole(text: String, keep: Int = SHOWN_OUTPUT_LINES): String {
     val lines = text.lines()
-    if (lines.size <= keep) return text
-    return "[${lines.size - keep} lines hidden]\n" + lines.takeLast(keep).joinToString("\n")
+    val shown = if (lines.size <= keep) lines else listOf("[${lines.size - keep} lines hidden]") + lines.takeLast(keep)
+    return shown.joinToString("\n") { "    $it" }
 }
 
 /** Caps output, keeping head and tail: build failures land at the end. */

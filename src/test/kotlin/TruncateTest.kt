@@ -10,8 +10,8 @@ import io.kotest.matchers.string.shouldStartWith
 class TruncateTest : FunSpec({
 
     test("console echo keeps only the last lines and counts the hidden ones") {
-        tailForConsole("a\nb\nc\nd\ne") shouldBe "a\nb\nc\nd\ne"
-        tailForConsole("1\n2\n3\n4\n5\n6\n7") shouldBe "[2 lines hidden]\n3\n4\n5\n6\n7"
+        tailForConsole("a\nb\nc\nd\ne") shouldBe "    a\n    b\n    c\n    d\n    e"
+        tailForConsole("1\n2\n3\n4\n5\n6\n7") shouldBe "    [2 lines hidden]\n    3\n    4\n    5\n    6\n    7"
     }
 
     test("output within the cap is returned untouched") {
