@@ -29,7 +29,7 @@ class ProjectInstructionsTest : FunSpec({
         p shouldContain "Project instructions, read from the working directory at startup"
         p shouldContain "## CLAUDE.md\nAlways run the tests."
         p shouldNotContain "## AGENTS.md"
-        instructionsNotice(dir) shouldBe "📄 Instructions: CLAUDE.md"
+        instructionsNotice(dir) shouldBe "📄  Instructions: CLAUDE.md"
     }
 
     test("both files, CLAUDE.md first, after the harness text") {
@@ -39,7 +39,7 @@ class ProjectInstructionsTest : FunSpec({
         val p = prompt(dir)
         p shouldStartWith "You are a coding agent"
         p.indexOf("## CLAUDE.md\nclaude rules") shouldBeLessThan p.indexOf("## AGENTS.md\nagents rules")
-        instructionsNotice(dir) shouldBe "📄 Instructions: CLAUDE.md, AGENTS.md"
+        instructionsNotice(dir) shouldBe "📄  Instructions: CLAUDE.md, AGENTS.md"
     }
 
     test("an empty file is ignored") {

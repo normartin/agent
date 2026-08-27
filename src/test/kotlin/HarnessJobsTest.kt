@@ -55,7 +55,7 @@ class HarnessJobsTest : FunSpec({
                 turn(answer("done"))
             )
             BashAgentHarness(workspace, "test-key", mock.baseUrl).use { harness ->
-                captureStdout { harness.runTask("go") } shouldContain "🧠 Look at the files"
+                captureStdout { harness.runTask("go") } shouldContain "🧠  Look at the files"
             }
             mock.requests[1].input.single { it.str("type") == "reasoning" } shouldBe reasoning("Look at the files")
         }

@@ -25,7 +25,7 @@ class AgentLogTest : FunSpec({
         val text = out.toString(Charsets.UTF_8)
         text shouldContain "👤"
         text shouldContain "say hi"
-        text shouldContain "🧠 Looking around"
+        text shouldContain "🧠  Looking around"
         text shouldContain "$ echo hi"
         text shouldContain "🤖"
         text shouldContain "all done"

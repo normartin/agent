@@ -37,7 +37,7 @@ fun renderLog(args: List<String>) {
         val r = Renderer(cfg, file.name)
         file.forEachLine { line ->
             val obj = runCatching { Json.parseToJsonElement(line).jsonObject }.getOrNull()
-            if (obj == null) println("⚠ invalid JSON line") else r.event(obj)
+            if (obj == null) println("⚠  invalid JSON line") else r.event(obj)
         }
         r.footer()
     }
@@ -115,14 +115,14 @@ private class Renderer(val cfg: Config, val fileName: String) {
                 println("$bar━━ $fileName ━━ ${obj.text("model")} · ${obj.text("workspace")} · ${clock(obj)}$extra")
                 inTurn = false
             }
-            "user" -> { println(); block("$bar👤 ${clock(obj)}  ", "$bar             ", obj.text("text").orEmpty(), prose = true); inTurn = true }
-            "job_notice" -> block("$body📣 ", "$body   ", obj.text("text").orEmpty())
+            "user" -> { println(); block("$bar👤  ${clock(obj)}  ", "$bar             ", obj.text("text").orEmpty(), prose = true); inTurn = true }
+            "job_notice" -> block("$body📣  ", "$body   ", obj.text("text").orEmpty())
             "tool_call" -> { calls++; toolCall(body, obj.text("arguments").orEmpty()) }
             "tool_result" -> block("$body    ", "$body    ", obj.text("output").orEmpty().ifBlank { "(no output)" })
             "response" -> response(body, bar, obj)
-            "trim" -> println("$body⚠ trim: dropped ${obj.strNum("dropped")} items (${k(obj.long("chars_before"))} → ${k(obj.long("chars_after"))} chars)")
-            "retry" -> println("$body⚠ retry: status ${obj.strNum("status")}, wait ${obj.strNum("wait_ms")}ms, attempt ${obj.strNum("attempt")}")
-            "error" -> block("$body⚠ error: ", "$body   ", obj.text("message").orEmpty())
+            "trim" -> println("$body⚠  trim: dropped ${obj.strNum("dropped")} items (${k(obj.long("chars_before"))} → ${k(obj.long("chars_after"))} chars)")
+            "retry" -> println("$body⚠  retry: status ${obj.strNum("status")}, wait ${obj.strNum("wait_ms")}ms, attempt ${obj.strNum("attempt")}")
+            "error" -> block("$body⚠  error: ", "$body   ", obj.text("message").orEmpty())
             "request" -> if (cfg.showRaw) println("$body· request attempt ${obj.strNum("attempt")} ${obj.text("url")}")
         }
     }
@@ -144,14 +144,14 @@ private class Renderer(val cfg: Config, val fileName: String) {
             .filter { it.isNotEmpty() }
         println()
         thoughts.ifEmpty { listOf("(no reasoning summary)") }.forEachIndexed { i, t ->
-            val line = "$body🧠 $t"
+            val line = "$body🧠  $t"
             println(if (i == 0) line.padEnd(maxOf(line.length + 3, 70)) + stats else line)
         }
         output.filter { it.text("type") == "message" }
             .flatMap { (it["content"] as? JsonArray).orEmpty() }
             .mapNotNull { (it as? JsonObject)?.text("text") }
             .filter { it.isNotBlank() }
-            .forEach { println(); block("$bar🤖 ${clock(obj)}  ", "$bar             ", it, prose = true) }
+            .forEach { println(); block("$bar🤖  ${clock(obj)}  ", "$bar             ", it, prose = true) }
     }
 
     private fun toolCall(body: String, raw: String) {
@@ -160,7 +160,7 @@ private class Renderer(val cfg: Config, val fileName: String) {
         val cmd = args.text("command")
         if ((args.text("action") ?: "run") == "run") { block("$body\$ ", "$body  ", cmd.orEmpty()); return }
         val head = listOfNotNull(args.text("action"), args.text("name"), args.text("seconds")?.let { "${it}s" }).joinToString(" ")
-        block("$body⚙ $head" + if (cmd != null) ": " else "", "$body  ", cmd.orEmpty())
+        block("$body⚙  $head" + if (cmd != null) ": " else "", "$body  ", cmd.orEmpty())
     }
 
     /** Line-based clipping: whole lines survive, long ones get a trailing ellipsis. */
