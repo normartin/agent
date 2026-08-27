@@ -1,4 +1,6 @@
 import io.kotest.core.spec.style.FunSpec
+import io.kotest.engine.spec.tempfile
+import io.kotest.matchers.string.shouldNotContain
 import io.kotest.matchers.comparables.shouldBeLessThanOrEqualTo
 import io.kotest.matchers.shouldBe
 import io.kotest.matchers.string.shouldContain
@@ -65,5 +67,30 @@ class TruncateTest : FunSpec({
 
     test("single-line output gets no line hint") {
         truncate("q".repeat(100_000)) shouldContain "chars elided] …"
+    }
+})
+
+class ReadTruncatedTest : FunSpec({
+
+    test("a small file comes back whole") {
+        val file = tempfile().apply { writeText("a\nb\n") }
+        readTruncated(file) shouldBe "a\nb\n"
+    }
+
+    test("a big file is cut like a string would be, and the marker points the sed at the file") {
+        val text = (1..1000).joinToString("\n") { "line $it" + "-".repeat(20) }
+        val file = tempfile().apply { writeText(text) }
+        val result = readTruncated(file)
+
+        // ASCII, so bytes are chars: the file must be cut exactly where the string is.
+        result.replace(" ${file.path} shows", " shows") shouldBe truncate(text)
+        val (from, to) = Regex("sed -n '(\\d+),(\\d+)p' ${Regex.escape(file.path)}").find(result)!!.groupValues.drop(1).map { it.toInt() }
+        result shouldNotContain "\n" + text.lines()[from]  // inside the gap
+        result shouldContain "\n" + text.lines()[to]       // the tail starts inside line `to`
+    }
+
+    test("a single-line file still names itself") {
+        val file = tempfile().apply { writeText("q".repeat(100_000)) }
+        readTruncated(file) shouldContain "chars elided; full output in ${file.path}] …"
     }
 })

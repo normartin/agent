@@ -6,6 +6,7 @@ import io.kotest.matchers.longs.shouldBeLessThan
 import io.kotest.matchers.shouldBe
 import io.kotest.matchers.shouldNotBe
 import io.kotest.matchers.string.shouldContain
+import io.kotest.matchers.string.shouldStartWith
 import io.kotest.engine.spec.tempdir
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.CopyOnWriteArrayList
@@ -26,9 +27,7 @@ class BackgroundJobsTest : FunSpec({
         job.finish()
 
         val report = job.report()
-        report shouldContain "hello"
-        report shouldContain "ERROR OUTPUT:"
-        report shouldContain "boom"
+        report shouldStartWith "hello\nboom\n"
         report shouldContain "[Exit Code: 3"
         job.state shouldBe JobState.EXITED
     }
@@ -201,16 +200,18 @@ class BackgroundJobsTest : FunSpec({
         }
     }
 
-    test("a job's log is capped, however much it prints") {
+    test("a job's report is capped however much it prints, and names the file with the rest") {
         val jobs = JobRegistry(workspace)
         val job = jobs.start("seq 1 200000")
         job.finish(30)
 
         val report = job.report()
-        report.length shouldBeLessThan MAX_JOB_LOG_CHARS * 2
+        report.length shouldBeLessThan MAX_OUTPUT_CHARS + 200
         report shouldContain "chars elided"
+        report shouldContain job.logFile.path
         report shouldContain "200000"
         report shouldContain "[Exit Code: 0"
+        job.logFile.length() shouldBe (1..200000).sumOf { it.toString().length + 1 }.toLong()
     }
 
     test("find resolves by name and reports the misses") {

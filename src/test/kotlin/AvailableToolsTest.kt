@@ -20,5 +20,6 @@ class AvailableToolsTest : FunSpec({
         val p = systemPrompt(tempdir(), depth = 0, subAgentCommand = null)
         p shouldContain "Available: "
         p shouldContain "\n$MAX_OUTPUT_CHARS chars is truncated in the middle"
+        p shouldContain "the marker names a"
     }
 })

@@ -13,7 +13,6 @@ import org.jline.reader.UserInterruptException
 import org.jline.terminal.TerminalBuilder
 import sun.misc.Signal
 import java.io.File
-import java.io.InputStream
 import java.net.URI
 import java.net.http.HttpClient
 import java.net.http.HttpRequest
@@ -42,7 +41,6 @@ const val MAX_ITERATIONS = 25
 const val TIMEOUT_SECONDS = 120L       // foreground command deadline
 // One API call. A think over a big tool result runs minutes, and an in-flight request cannot be cancelled.
 const val API_TIMEOUT_SECONDS = 600L
-const val MAX_JOB_LOG_CHARS = 40_000   // per background job stream
 const val DEFAULT_WAIT_SECONDS = 60L
 const val MAX_WAIT_SECONDS = 600L
 
@@ -83,8 +81,9 @@ fun systemPrompt(
     You are in an ongoing console conversation; keep earlier turns in mind. When the request is done, answer and stop.
 
     Chain steps with && or a small script. A foreground command is killed after ${TIMEOUT_SECONDS}s and output over
-    $MAX_OUTPUT_CHARS chars is truncated in the middle (so read at most ~300 lines per call); never start a server
-    that way. Slower things go in the background:
+    $MAX_OUTPUT_CHARS chars is truncated in the middle (so read at most ~300 lines per call); the marker names a
+    file holding the full output, so sed -n or grep -n that instead of re-running. Never start a server in the
+    foreground. Slower things go in the background:
       {"command":"ls -la"}                                       foreground (default)
       {"action":"start","command":"./gradlew build","name":"build"}
       {"action":"output","name":"server"}                        printed so far
@@ -382,7 +381,7 @@ class BashAgentHarness(
                             interrupted -> "[Interrupted by the user — process killed]"
                             else -> "[TIMED OUT after ${timeoutSeconds}s — process killed. Output above is partial.]"
                         }
-                        truncate(job.report(note))
+                        job.report(note)
                     },
                     onFailure = { "Execution Error: ${it.message}" }
                 )
@@ -401,12 +400,12 @@ class BashAgentHarness(
                 job.await(2)
                 job.reported = true // so pumpJobs does not repeat it
                 println("🛑 Stopped background job \"${job.name}\"")
-                "Stopped background job \"${job.name}\".\n${truncate(job.report())}"
+                "Stopped background job \"${job.name}\".\n${job.report()}"
             }
 
             "output" -> withJob(name) { job ->
                 if (job.done) job.reported = true
-                truncate(job.report())
+                job.report()
             }
 
             "wait" -> withJob(name) { job ->
@@ -414,7 +413,7 @@ class BashAgentHarness(
                     .coerceIn(1, MAX_WAIT_SECONDS)
                 println("⏳ Waiting up to ${seconds}s for background job \"${job.name}\"…")
                 if (job.await(seconds) { interrupted }) job.reported = true
-                truncate(job.report())
+                job.report()
             }
 
             else -> "Execution Error: unknown action '$action' — use run, start, stop, output or wait."
@@ -431,7 +430,7 @@ class BashAgentHarness(
     /** Delivers finished jobs and, at a user turn, what still runs. As messages, never in item 0: the cache keys on it. */
     private fun pumpJobs(announceRunning: Boolean) {
         jobs.drainFinished().forEach { job ->
-            val notice = "[background job \"${job.name}\" finished] ${job.command}\n${truncate(job.report())}"
+            val notice = "[background job \"${job.name}\" finished] ${job.command}\n${job.report()}"
             println("🏁 $notice\n")
             log?.event("job_notice") { put("text", notice) }
             input.add(message("user", notice))
@@ -647,36 +646,46 @@ fun truncate(text: String, limit: Int = MAX_OUTPUT_CHARS): String {
     if (text.length <= limit) return text
     val head = text.take(limit * 2 / 3)
     val tail = text.takeLast(limit / 3)
-    val elided = text.length - head.length - tail.length
-    // Name the missing lines, so one sed -n fetches exactly the gap instead of the model re-reading everything.
-    val from = head.count { it == '\n' } + 1
-    val to = from + text.substring(head.length, head.length + elided).count { it == '\n' }
-    val total = text.count { it == '\n' } + 1
-    val hint = if (total > 1) "; lines $from-$to of $total, sed -n '$from,${to}p' shows them" else ""
-    return "$head\n… [$elided chars elided$hint] …\n$tail"
+    val middle = text.substring(head.length, text.length - tail.length)
+    return head + elisionMarker(middle.length.toLong(), head.count { it == '\n' }, middle.count { it == '\n' }, tail.count { it == '\n' }, null) + tail
 }
 
-/**
- * Keeps the first [head] and last [cap] chars a job printed: a build's first error and its summary sit at
- * opposite ends. [head] matches what [truncate] keeps, so the model sees the real start of the output.
- */
-class BoundedLog(private val cap: Int = MAX_JOB_LOG_CHARS, private val head: Int = MAX_OUTPUT_CHARS * 2 / 3) {
-    private val first = StringBuilder()
-    private val buf = StringBuilder()
-    private var elided = 0L
-
-    @Synchronized
-    fun append(text: String) {
-        val room = head - first.length
-        if (room >= text.length) { first.append(text); return }
-        if (room > 0) { first.append(text, 0, room); buf.append(text, room, text.length) } else buf.append(text)
-        val drop = buf.length - cap
-        if (drop > 0) { buf.delete(0, drop); elided += drop }
+/** Names the missing lines (and the file, if any), so one sed -n fetches exactly the gap instead of the model re-reading everything. */
+fun elisionMarker(elided: Long, headLines: Int, middleLines: Int, tailLines: Int, path: String?): String {
+    val from = headLines + 1
+    val to = from + middleLines
+    val total = headLines + middleLines + tailLines + 1
+    val hint = when {
+        total > 1 -> "; lines $from-$to of $total, sed -n '$from,${to}p'${path?.let { " $it" } ?: ""} shows them"
+        path != null -> "; full output in $path"
+        else -> ""
     }
+    return "\n… [$elided chars elided$hint] …\n"
+}
 
-    /** The marker sits mid-output, so [truncate] leaves both ends intact. */
-    @Synchronized
-    fun snapshot() = if (elided == 0L) "$first$buf" else "$first\n… [$elided chars elided] …\n$buf"
+/** [truncate] for a job's log: one sequential pass, so a gigabyte of output never sits in memory. Bytes, not chars. */
+fun readTruncated(file: File, limit: Int = MAX_OUTPUT_CHARS): String {
+    val size = file.length()
+    if (size <= limit) return file.readText()
+    val headLen = limit * 2 / 3
+    val tailLen = limit / 3
+    val newline = '\n'.code.toByte()
+    file.inputStream().buffered().use { stream ->
+        val head = stream.readNBytes(headLen)
+        var middleLines = 0
+        var left = size - headLen - tailLen
+        val buf = ByteArray(1 shl 16)
+        while (left > 0) {
+            val n = stream.read(buf, 0, minOf(buf.size.toLong(), left).toInt())
+            if (n <= 0) break
+            for (i in 0 until n) if (buf[i] == newline) middleLines++
+            left -= n
+        }
+        // Exactly tailLen: a running job's file may have grown since size was read.
+        val tail = stream.readNBytes(tailLen)
+        val marker = elisionMarker(size - headLen - tailLen, head.count { it == newline }, middleLines, tail.count { it == newline }, file.path)
+        return String(head) + marker + String(tail)
+    }
 }
 
 /** What a terminal would show: progress bars redraw with \r, and every kept frame is wasted budget. */
@@ -687,11 +696,12 @@ fun collapseCarriageReturns(text: String): String {
 
 enum class JobState { RUNNING, EXITED, KILLED }
 
-/** One command detached from the turn that started it. Three daemon threads drain and reap it. */
+/** One command detached from the turn that started it. Its output goes straight to [logFile]; a daemon thread reaps it. */
 class BackgroundJob(
     val name: String,
     val command: String,
     private val process: Process,
+    val logFile: File,
     private val onFinished: (BackgroundJob) -> Unit = {}
 ) {
     val startedAt = System.currentTimeMillis()
@@ -705,30 +715,11 @@ class BackgroundJob(
     val done get() = state != JobState.RUNNING
     val elapsedSeconds get() = ((finishedAt ?: System.currentTimeMillis()) - startedAt) / 1000
 
-    // Before the threads: initialisers run in order.
-    private val out = BoundedLog()
-    private val err = BoundedLog()
-
-    // Daemons: a live job's pipes never close and would keep the JVM up after main().
-    private val outDrain = thread(isDaemon = true) { drain(process.inputStream, out) }
-    private val errDrain = thread(isDaemon = true) { drain(process.errorStream, err) }
+    // Daemon: a live job would otherwise keep the JVM up after main().
     private val watcher = thread(isDaemon = true) {
         process.waitFor()
-        outDrain.join(2000)
-        errDrain.join(2000)
         finish(runCatching { process.exitValue() }.getOrNull())
         onFinished(this)
-    }
-
-    private fun drain(stream: InputStream, log: BoundedLog) = runCatching {
-        stream.bufferedReader().use { reader ->
-            val buffer = CharArray(8192)
-            while (true) {
-                val read = reader.read(buffer)
-                if (read < 0) break
-                log.append(String(buffer, 0, read))
-            }
-        }
     }
 
     // Synchronised with stop(): a kill and a natural exit race to name the state.
@@ -743,7 +734,7 @@ class BackgroundJob(
     fun stop() {
         if (done) return
         state = JobState.KILLED
-        // Descendants first, or a grandchild holds the pipes open.
+        // Descendants too, or a grandchild outlives the job.
         process.descendants().forEach { it.destroyForcibly() }
         process.destroyForcibly()
     }
@@ -764,11 +755,9 @@ class BackgroundJob(
 
     /** The output so far. [note] replaces the status line. */
     fun report(note: String? = null) = buildString {
-        // At read time: a \r frame can straddle two drain chunks.
-        val stdout = collapseCarriageReturns(out.snapshot())
-        val stderr = collapseCarriageReturns(err.snapshot())
-        if (stdout.isNotBlank()) append(stdout)
-        if (stderr.isNotBlank()) append("ERROR OUTPUT:\n").append(stderr)
+        // At read time: a \r frame can straddle two writes.
+        val output = collapseCarriageReturns(readTruncated(logFile))
+        if (output.isNotBlank()) append(output)
         append("\n")
         append(
             note ?: when (state) {
@@ -791,26 +780,31 @@ class JobRegistry(
     private var counter = 0
     @Volatile private var foreground: BackgroundJob? = null
 
-    private fun launch(command: String) = ProcessBuilder("bash", "-c", command)
-        .directory(workspace)
-        .redirectInput(ProcessBuilder.Redirect.from(File("/dev/null"))) // never block on input
-        .apply {
-            environment()["AGENT_DEPTH"] = (depth + 1).toString()
-            environment()["AGENT_LOG"] = log?.path ?: "" // absolute, so a child that cd's still finds it
-        }
-        .start()
+    private fun launch(name: String, command: String, onFinished: (BackgroundJob) -> Unit = {}): BackgroundJob {
+        // stdout and stderr merged like a terminal, straight to a file: the log is exactly what the model
+        // sees, so the marker's line numbers are exact and nothing is lost however much a job prints.
+        val logFile = File.createTempFile("agent-", ".log")
+        val process = ProcessBuilder("bash", "-c", command)
+            .directory(workspace)
+            .redirectInput(ProcessBuilder.Redirect.from(File("/dev/null"))) // never block on input
+            .redirectErrorStream(true)
+            .redirectOutput(logFile)
+            .apply {
+                environment()["AGENT_DEPTH"] = (depth + 1).toString()
+                environment()["AGENT_LOG"] = log?.path ?: "" // absolute, so a child that cd's still finds it
+            }
+            .start()
+        return BackgroundJob(name, command, process, logFile, onFinished)
+    }
 
     /** Throws only if [command] will not launch. */
-    fun start(command: String, requested: String? = null): BackgroundJob {
-        val process = launch(command)
-        return synchronized(this) {
-            BackgroundJob(nameFor(requested), command, process, onFinished).also { jobs[it.name] = it }
-        }
+    fun start(command: String, requested: String? = null): BackgroundJob = synchronized(this) {
+        launch(nameFor(requested), command, onFinished).also { jobs[it.name] = it }
     }
 
     /** Runs [command] and waits, killing it at [seconds]. Not registered. */
     fun run(command: String, seconds: Long, cancelled: () -> Boolean): BackgroundJob {
-        val job = BackgroundJob("foreground", command, launch(command))
+        val job = launch("foreground", command)
         foreground = job
         try {
             if (!job.await(seconds, cancelled)) { job.stop(); job.await(2) }
