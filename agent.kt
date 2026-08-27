@@ -56,7 +56,7 @@ val INSTRUCTION_FILES = listOf("CLAUDE.md", "AGENTS.md")
 const val MAX_INSTRUCTIONS_CHARS = 20_000
 
 // Sized against TPM, not the context window: the whole history is resent every iteration.
-const val MAX_OUTPUT_CHARS = 6000
+const val MAX_OUTPUT_CHARS = 12_000
 const val MAX_HISTORY_CHARS = 120_000
 // Trimming forfeits the prompt cache behind the cut, so cut deep and rarely.
 const val TRIM_TARGET_CHARS = MAX_HISTORY_CHARS * 6 / 10
@@ -79,11 +79,11 @@ fun systemPrompt(
     tools: String = availableTools()
 ): String = """
     You are a coding agent with a local bash shell via the "bash" tool. Working directory: ${workspace.absolutePath}
-    Commands already run there; no need to cd into it. $tools
+    Commands already run there; no need to cd into it. $tools There is no apply_patch: edit with sed, python3 or a heredoc.
     You are in an ongoing console conversation; keep earlier turns in mind. When the request is done, answer and stop.
 
     Chain steps with && or a small script. A foreground command is killed after ${TIMEOUT_SECONDS}s and output over
-    $MAX_OUTPUT_CHARS chars is truncated in the middle (so read at most ~150 lines per call); never start a server
+    $MAX_OUTPUT_CHARS chars is truncated in the middle (so read at most ~300 lines per call); never start a server
     that way. Slower things go in the background:
       {"command":"ls -la"}                                       foreground (default)
       {"action":"start","command":"./gradlew build","name":"build"}
@@ -91,9 +91,9 @@ fun systemPrompt(
       {"action":"wait","name":"build","seconds":120}
       {"action":"stop","name":"server"}
     Never poll: a finished job's output is delivered as a [background job "name" finished] message, and each
-    user turn is preceded by a [background jobs still running] listing. Use "wait" only when you need the
-    result to answer. A finished job may hand you a turn without user input: report it and stop; fix it only
-    if it failed. Background jobs survive an interrupted task and die with the session.
+    user turn is preceded by a [background jobs still running] listing. Use "output" or "wait" only when the
+    user asks for a job's status or you need its result to answer. A finished job may hand you a turn without
+    user input: report it and stop; fix it only if it failed. Background jobs survive an interrupted task and die with the session.
 
     Keep command count low: batch related reads, make the smallest correct edit, then run the smallest validation
     that proves correctness. Prefer grep/sed one-liners over writing a script. Web pages: never print raw HTML;
@@ -647,7 +647,13 @@ fun truncate(text: String, limit: Int = MAX_OUTPUT_CHARS): String {
     if (text.length <= limit) return text
     val head = text.take(limit * 2 / 3)
     val tail = text.takeLast(limit / 3)
-    return "$head\n… [${text.length - head.length - tail.length} chars elided] …\n$tail"
+    val elided = text.length - head.length - tail.length
+    // Name the missing lines, so one sed -n fetches exactly the gap instead of the model re-reading everything.
+    val from = head.count { it == '\n' } + 1
+    val to = from + text.substring(head.length, head.length + elided).count { it == '\n' }
+    val total = text.count { it == '\n' } + 1
+    val hint = if (total > 1) "; lines $from-$to of $total, sed -n '$from,${to}p' shows them" else ""
+    return "$head\n… [$elided chars elided$hint] …\n$tail"
 }
 
 /**

@@ -16,7 +16,7 @@ class TruncateTest : FunSpec({
     test("oversized output is cut down to the cap") {
         val result = truncate("x".repeat(500_000))
         // The elision marker itself adds a few characters on top of head + tail.
-        result.length shouldBeLessThanOrEqualTo MAX_OUTPUT_CHARS + 64
+        result.length shouldBeLessThanOrEqualTo MAX_OUTPUT_CHARS + 128
     }
 
     test("both the head and the tail survive") {
@@ -33,7 +33,7 @@ class TruncateTest : FunSpec({
         val result = truncate(text)
         result shouldContain "chars elided"
 
-        val dropped = Regex("\\[(\\d+) chars elided]").find(result)!!.groupValues[1].toInt()
+        val dropped = Regex("\\[(\\d+) chars elided").find(result)!!.groupValues[1].toInt()
         val head = MAX_OUTPUT_CHARS * 2 / 3
         val tail = MAX_OUTPUT_CHARS / 3
         dropped shouldBe text.length - head - tail
@@ -49,5 +49,21 @@ class TruncateTest : FunSpec({
         val result = truncate("z".repeat(MAX_OUTPUT_CHARS * 10))
         result.takeWhile { it == 'z' }.length shouldBe head
         result.takeLastWhile { it == 'z' }.length shouldBe tail
+    }
+
+    test("the marker names the line range that was cut, so one sed -n can fetch it") {
+        val text = (1..1000).joinToString("\n") { "line $it" + "-".repeat(20) }
+        val result = truncate(text)
+        val (from, to, total) = Regex("lines (\\d+)-(\\d+) of (\\d+)").find(result)!!.groupValues.drop(1).map { it.toInt() }
+        total shouldBe 1000
+        result shouldContain "sed -n '$from,${to}p'"
+        // The head ends inside line `from` and the tail starts inside line `to`: both are partially shown.
+        val lines = text.lines()
+        result shouldStartWith lines.take(from - 1).joinToString("\n")
+        result shouldEndWith lines.drop(to).joinToString("\n")
+    }
+
+    test("single-line output gets no line hint") {
+        truncate("q".repeat(100_000)) shouldContain "chars elided] …"
     }
 })
