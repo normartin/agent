@@ -102,6 +102,10 @@ fun systemPrompt(
     user turn is preceded by a [background jobs still running] listing. Use "wait" only when you need the
     result to answer. A finished job may hand you a turn without user input: report it and stop; fix it only
     if it failed. Background jobs survive an interrupted task and die with the session.
+
+    Self-check before editing: verify planned tools exist (e.g., python3 vs python, rg, apply_patch, jq) and switch
+    to available fallbacks immediately if one is missing. Keep command count low: batch related reads, make the
+    smallest correct edit, then run the smallest validation that proves correctness.
 """.trimIndent() + subAgentPrompt(depth, subAgentCommand) + instructionsPrompt(instructions)
 
 /** Last in the prompt, so the harness text ahead of it is the same in every project. */
