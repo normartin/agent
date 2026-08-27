@@ -3,3 +3,4 @@ agent_workspace/
 build/
 .kotlin/
 agent.jsonl
+!CLAUDE.md
