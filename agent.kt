@@ -85,14 +85,16 @@ fun systemPrompt(
     workspace: File,
     depth: Int = AGENT_DEPTH,
     subAgentCommand: String? = selfCommand(),
-    instructions: String = projectInstructions(workspace)
+    instructions: String = projectInstructions(workspace),
+    tools: String = availableTools()
 ): String = """
     You are a coding agent with a local bash shell via the "bash" tool. Working directory: ${workspace.absolutePath}
-    Commands already run there; no need to cd into it.
+    Commands already run there; no need to cd into it. $tools
     You are in an ongoing console conversation; keep earlier turns in mind. When the request is done, answer and stop.
 
-    Chain steps with && or a small script. A foreground command is killed after ${TIMEOUT_SECONDS}s and long output
-    is truncated in the middle, so never start a server that way. Slower things go in the background:
+    Chain steps with && or a small script. A foreground command is killed after ${TIMEOUT_SECONDS}s and output over
+    $MAX_OUTPUT_CHARS chars is truncated in the middle (so read at most ~150 lines per call); never start a server
+    that way. Slower things go in the background:
       {"command":"ls -la"}                                       foreground (default)
       {"action":"start","command":"./gradlew build","name":"build"}
       {"action":"output","name":"server"}                        printed so far
@@ -103,9 +105,10 @@ fun systemPrompt(
     result to answer. A finished job may hand you a turn without user input: report it and stop; fix it only
     if it failed. Background jobs survive an interrupted task and die with the session.
 
-    Self-check before editing: verify planned tools exist (e.g., python3 vs python, rg, apply_patch, jq) and switch
-    to available fallbacks immediately if one is missing. Keep command count low: batch related reads, make the
-    smallest correct edit, then run the smallest validation that proves correctness.
+    Keep command count low: batch related reads, make the smallest correct edit, then run the smallest validation
+    that proves correctness. Prefer grep/sed one-liners over writing a script. Web pages: never print raw HTML;
+    docs sites usually serve markdown at the URL with .md appended (or list pages in /llms.txt), otherwise strip
+    tags (sed 's/<[^>]*>//g') and grep -C for what you need.
 """.trimIndent() + subAgentPrompt(depth, subAgentCommand) + instructionsPrompt(instructions)
 
 /** Last in the prompt, so the harness text ahead of it is the same in every project. */
@@ -664,6 +667,17 @@ private fun runConsole(workspace: File, apiKey: String, log: JsonlLog?) {
  */
 fun selfCommand(): String? =
     System.getenv("AGENT_CMD")?.takeIf { it.isNotBlank() } ?: "./agent.kt"
+
+/**
+ * Which optional tools are on PATH, stated once in the prompt: probed at startup so the prompt stays
+ * cache-stable, and told rather than left for the model to discover with a wasted call.
+ */
+fun availableTools(names: List<String> = listOf("rg", "jq", "python3", "curl", "git", "gh")): String {
+    val path = System.getenv("PATH").orEmpty().split(File.pathSeparator)
+    val (have, missing) = names.partition { n -> path.any { File(it, n).canExecute() } }
+    return "Available: ${have.joinToString(", ").ifEmpty { "none of the optional tools" }}" +
+        (if (missing.isEmpty()) "." else " (no ${missing.joinToString(", no ")}).")
+}
 
 /** One line naming the instruction files that went into the prompt, or null when there are none. */
 fun instructionsNotice(workspace: File): String? =
