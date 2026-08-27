@@ -182,10 +182,7 @@ data class Turn(
     val cachedPromptTokens: Long,
     val completionTokens: Long,
     val reasoningTokens: Long
-) {
-    /** Mid-session this should sit high; a sudden 0 means the prefix changed. */
-    val cacheHitPercent: Int get() = if (promptTokens == 0L) 0 else (cachedPromptTokens * 100 / promptTokens).toInt()
-}
+)
 
 /** The "reasoning" items' summary parts. */
 fun reasoningSummary(output: JsonArray): String? = output
@@ -277,6 +274,7 @@ class BashAgentHarness(
     private fun runLoop(): String? {
         interrupted = false
         busy = true
+        var inTok = 0L; var cachedTok = 0L; var outTok = 0L; var reasonTok = 0L
         try {
             repeat(MAX_ITERATIONS) {
                 if (interrupted) { println("\n⏹️ Interrupted. Ask again to continue."); return null }
@@ -305,13 +303,8 @@ class BashAgentHarness(
                 promptTokens += turn.promptTokens
                 cachedPromptTokens += turn.cachedPromptTokens
                 completionTokens += turn.completionTokens
-                println(
-                    "📊 %,d in (%,d cached, %d%% hit) / %,d out (%,d reasoning) · \$%.4f · session \$%.4f".format(
-                        Locale.ROOT, turn.promptTokens, turn.cachedPromptTokens, turn.cacheHitPercent,
-                        turn.completionTokens, turn.reasoningTokens,
-                        turnCost(turn.promptTokens, turn.cachedPromptTokens, turn.completionTokens), sessionCost()
-                    )
-                )
+                inTok += turn.promptTokens; cachedTok += turn.cachedPromptTokens
+                outTok += turn.completionTokens; reasonTok += turn.reasoningTokens
 
                 // Echoed back verbatim, reasoning included: that keeps the model's thinking alive.
                 turn.output.forEach { input.add(it.jsonObject) }
@@ -332,6 +325,13 @@ class BashAgentHarness(
             return null
         } finally {
             busy = false
+            // Once per turn, not per call: the tool loop is the noisy part. A low hit % mid-session means the prefix changed.
+            if (inTok > 0) println(
+                "📊 %,d in (%,d cached, %d%% hit) / %,d out (%,d reasoning) · \$%.4f · session \$%.4f".format(
+                    Locale.ROOT, inTok, cachedTok, cachedTok * 100 / inTok, outTok, reasonTok,
+                    turnCost(inTok, cachedTok, outTok), sessionCost()
+                )
+            )
         }
     }
 
