@@ -68,10 +68,10 @@ class ForegroundRunTest : FunSpec({
         // running on, so descendants have to go too.
         val marker = "kotest-foreground-timeout-marker"
         val started = System.currentTimeMillis()
-        val job = JobRegistry(workspace).run("sleep 300 & sleep 300 # $marker", 2) { false }
+        val job = JobRegistry(workspace).run("sleep 300 & sleep 300 # $marker", 1) { false }
         val elapsedMs = System.currentTimeMillis() - started
 
-        elapsedMs shouldBeGreaterThanOrEqual 1_900L
+        elapsedMs shouldBeGreaterThanOrEqual 900L
         elapsedMs shouldBeLessThan 15_000L
         job.state shouldBe JobState.KILLED
 
@@ -86,7 +86,7 @@ class ForegroundRunTest : FunSpec({
         // The deadline is 600s: only the interrupt can end this in time.
         val runner = thread { job = jobs.run("sleep 300 # $marker", 600) { interrupted } }
 
-        Thread.sleep(1_500)
+        Thread.sleep(500)
         val killedAt = System.currentTimeMillis()
         interrupted = true
         jobs.interruptForeground()
@@ -130,11 +130,11 @@ class ForegroundRunTest : FunSpec({
                 turn(reasoning(), bash(command = "sleep 300")),
                 turn(answer("that took too long"))
             )
-            BashAgentHarness(workspace, "test-key", mock.baseUrl, timeoutSeconds = 2).use { it.runTask("hang") }
+            BashAgentHarness(workspace, "test-key", mock.baseUrl, timeoutSeconds = 1).use { it.runTask("hang") }
 
-            // "[Killed after 2s]" is what the job itself would say, which does
+            // "[Killed after 1s]" is what the job itself would say, which does
             // not tell the model whether it was the deadline or the user.
-            mock.requests[1].input.last().str("output")!! shouldContain "TIMED OUT after 2s"
+            mock.requests[1].input.last().str("output")!! shouldContain "TIMED OUT after 1s"
         }
     }
 })

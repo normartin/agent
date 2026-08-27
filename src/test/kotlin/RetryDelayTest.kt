@@ -31,8 +31,8 @@ class RetryDelayTest : FunSpec({
 
     test("an uninterrupted wait runs to completion") {
         val started = System.currentTimeMillis()
-        sleepUnlessCancelled(400) { false } shouldBe true
-        (System.currentTimeMillis() - started) shouldBeGreaterThanOrEqual 390L
+        sleepUnlessCancelled(250) { false } shouldBe true
+        (System.currentTimeMillis() - started) shouldBeGreaterThanOrEqual 240L
     }
 
     test("an already-cancelled wait returns at once") {
@@ -44,7 +44,7 @@ class RetryDelayTest : FunSpec({
     test("a wait notices cancellation that arrives partway through") {
         // Ctrl+C during a long rate-limit wait must not wedge the console.
         val cancelled = AtomicBoolean(false)
-        thread { Thread.sleep(300); cancelled.set(true) }
+        thread { Thread.sleep(150); cancelled.set(true) }
 
         val started = System.currentTimeMillis()
         sleepUnlessCancelled(30_000) { cancelled.get() } shouldBe false

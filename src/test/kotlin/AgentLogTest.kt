@@ -7,6 +7,7 @@ import java.io.File
 import java.io.PrintStream
 
 /** agent-log.kt reads what agent.kt writes today; a log produced by the current harness must render. */
+@io.kotest.core.annotation.Isolate // swaps System.out, so it must not overlap the concurrent specs
 class AgentLogTest : FunSpec({
 
     test("renders a fresh agent.kt log as a transcript") {

@@ -246,7 +246,7 @@ class ApiProtocolTest : FunSpec({
 
         test("a server error is retried too") {
             MockOpenAi().use { mock ->
-                mock.script(Reply(503, "upstream boom"), turn(answer("recovered")))
+                mock.script(Reply(503, "upstream boom", headers = mapOf("retry-after" to "0")), turn(answer("recovered")))
                 assistantText(mock.call().output) shouldBe "recovered"
                 mock.requests.size shouldBe 2
             }

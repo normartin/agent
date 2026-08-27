@@ -11,6 +11,7 @@ import java.util.concurrent.TimeUnit
  * finished job's output on its own, and tells the model what is still running.
  * These drive the whole loop against the mock and read the requests it recorded.
  */
+@io.kotest.core.annotation.Isolate // swaps System.out, so it must not overlap the concurrent specs
 class HarnessJobsTest : FunSpec({
 
     val workspace = tempdir()
@@ -67,7 +68,7 @@ class HarnessJobsTest : FunSpec({
                 // Start something short, then spend a turn in the foreground so
                 // it is certainly over by the time the third request is built.
                 turn(reasoning(), bash(action = "start", command = "echo ingested", name = "probe")),
-                turn(reasoning(), bash(command = "sleep 2")),
+                turn(reasoning(), bash(command = "sleep 1")),
                 turn(answer("done"))
             )
             BashAgentHarness(workspace, "test-key", mock.baseUrl).use { it.runTask("run something in the background") }
@@ -166,7 +167,7 @@ class HarnessJobsTest : FunSpec({
             MockOpenAi().use { mock ->
                 mock.script(
                     turn(reasoning(), bash(action = "start", command = "echo quick", name = "quick")),
-                    turn(reasoning(), bash(command = "sleep 2")),
+                    turn(reasoning(), bash(command = "sleep 1")),
                     turn(answer("done"))
                 )
                 BashAgentHarness(workspace, "test-key", mock.baseUrl).use { harness ->

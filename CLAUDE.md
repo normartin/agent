@@ -17,6 +17,8 @@ The code should stay short and readable. If new features required signigificantl
 ## Commands
 
 - `./gradlew test` — run the suite (`useJUnitPlatform()` is required for Kotest).
+  Specs run concurrently, one thread each (`src/test/kotlin/ProjectConfig.kt`); a spec that swaps
+  `System.out` or other global state must be marked `@Isolate`.
 - `./gradlew run` — start the console. Needs `OPENAI_API_KEY`.
 - `OPENAI_BASE_URL` redirects the API to a proxy or local server.
 - `AGENT_LOG` names a JSON-lines logfile (default `agent-YYYYMMDD-HHMMSS.jsonl`, local time, per session in the cwd; set it empty to

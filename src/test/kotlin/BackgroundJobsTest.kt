@@ -149,7 +149,7 @@ class BackgroundJobsTest : FunSpec({
             val job = jobs.start("echo first; sleep 30")
             // The point of the chunked drain: a server's log is readable while
             // the server is still up.
-            job.await(10) { false } shouldBe false
+            job.await(1) { false } shouldBe false
             job.report() shouldContain "first"
             job.report() shouldContain "[Still running after"
 
@@ -158,7 +158,7 @@ class BackgroundJobsTest : FunSpec({
 
         test("await returns as soon as the job is over") {
             val jobs = JobRegistry(workspace)
-            val job = jobs.start("sleep 1; echo done")
+            val job = jobs.start("sleep 0.2; echo done")
 
             val started = System.currentTimeMillis()
             job.await(30) { false } shouldBe true
