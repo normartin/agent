@@ -1,7 +1,8 @@
 # CLAUDE.md
 
 A single-file Kotlin CLI agent: an interactive console that drives a local bash
-shell through OpenAI Responses API (`/v1/responses`) tool calls.
+shell through OpenAI Responses API (`/v1/responses`) tool calls. It is meant to be simple and token efficient.
+The code should stay short and readable. If new features required signigificantly more code, ask the user..
 
 ## Layout
 
