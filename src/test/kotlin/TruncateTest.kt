@@ -9,6 +9,11 @@ import io.kotest.matchers.string.shouldStartWith
 
 class TruncateTest : FunSpec({
 
+    test("console echo keeps only the last lines and counts the hidden ones") {
+        tailForConsole("a\nb\nc\nd\ne") shouldBe "a\nb\nc\nd\ne"
+        tailForConsole("1\n2\n3\n4\n5\n6\n7") shouldBe "[2 lines hidden]\n3\n4\n5\n6\n7"
+    }
+
     test("output within the cap is returned untouched") {
         truncate("small") shouldBe "small"
         val exact = "x".repeat(MAX_OUTPUT_CHARS)

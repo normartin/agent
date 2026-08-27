@@ -56,6 +56,8 @@ const val MAX_INSTRUCTIONS_CHARS = 20_000
 // Sized against TPM, not the context window: the whole history is resent every iteration.
 const val MAX_OUTPUT_CHARS = 12_000
 const val MAX_HISTORY_CHARS = 120_000
+/** Console echo only; the model and the log always get the whole result. */
+const val SHOWN_OUTPUT_LINES = 5
 // Trimming forfeits the prompt cache behind the cut, so cut deep and rarely.
 const val TRIM_TARGET_CHARS = MAX_HISTORY_CHARS * 6 / 10
 
@@ -350,7 +352,7 @@ class BashAgentHarness(
             call.str("name") != "bash" -> "Execution Error: there is no tool named '${call.str("name")}'."
             else -> runBashCall(args, rawArgs)
         }
-        println("📥 Output:\n$result\n")
+        println("📥 Output:\n${tailForConsole(result)}\n")
         log?.event("tool_result") {
             put("call_id", id)
             put("output", result)
@@ -640,6 +642,13 @@ fun availableTools(names: List<String> = listOf("rg", "jq", "python3", "curl", "
 /** Names the loaded instruction files, or null when there are none. */
 fun instructionsNotice(workspace: File): String? =
     instructionFiles(workspace).takeIf { it.isNotEmpty() }?.let { "📄 Instructions: " + it.joinToString(", ") { f -> f.name } }
+
+/** Last few lines for the console, so long results don't drown the prompt. */
+fun tailForConsole(text: String, keep: Int = SHOWN_OUTPUT_LINES): String {
+    val lines = text.lines()
+    if (lines.size <= keep) return text
+    return "[${lines.size - keep} lines hidden]\n" + lines.takeLast(keep).joinToString("\n")
+}
 
 /** Caps output, keeping head and tail: build failures land at the end. */
 fun truncate(text: String, limit: Int = MAX_OUTPUT_CHARS): String {
