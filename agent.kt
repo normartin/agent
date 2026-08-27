@@ -3,8 +3,14 @@
 //KOTLIN 2.4.10
 //DEPS org.jetbrains.kotlin:kotlin-stdlib:2.4.10
 //DEPS org.jetbrains.kotlinx:kotlinx-serialization-json:1.7.3
+//DEPS org.jline:jline:3.30.16
 
 import kotlinx.serialization.json.*
+import org.jline.reader.EndOfFileException
+import org.jline.reader.LineReader
+import org.jline.reader.LineReaderBuilder
+import org.jline.reader.UserInterruptException
+import org.jline.terminal.TerminalBuilder
 import sun.misc.Signal
 import java.io.File
 import java.io.InputStream
@@ -15,16 +21,17 @@ import java.net.http.HttpResponse
 import java.time.Duration
 import java.util.Locale
 import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.Semaphore
 import java.util.concurrent.TimeUnit
 import kotlin.concurrent.thread
 import kotlin.system.exitProcess
 
-const val MODEL = "gpt-5"
+const val MODEL = "gpt-5.3-codex"
 
 // USD per 1M tokens; move with MODEL.
-const val INPUT_USD_PER_1M = 1.25
-const val CACHED_INPUT_USD_PER_1M = 0.125
-const val OUTPUT_USD_PER_1M = 10.00
+const val INPUT_USD_PER_1M = 1.75
+const val CACHED_INPUT_USD_PER_1M = 0.175
+const val OUTPUT_USD_PER_1M = 14.00
 
 const val MAX_ITERATIONS = 15
 const val TIMEOUT_SECONDS = 120L       // foreground command deadline
@@ -434,7 +441,7 @@ class BashAgentHarness(
                     )
                 )
 
-                // Echo every output item back verbatim, reasoning included: that keeps gpt-5's thinking alive.
+                // Echo every output item back verbatim, reasoning included: that keeps gpt-5.x's thinking alive.
                 turn.output.forEach { input.add(it.jsonObject) }
 
                 val text = assistantText(turn.output)
@@ -653,7 +660,7 @@ fun callOpenAI(
     baseUrl: String = API_BASE,
     cancelled: () -> Boolean = { false }
 ): Turn {
-    // No temperature: gpt-5 is a reasoning model. "store" stays at its default of true so the bare
+    // No temperature: gpt-5.x is a reasoning model. "store" stays at its default of true so the bare
     // reasoning ids we echo back stay resolvable; store=false needs include=["reasoning.encrypted_content"].
     val payload = buildJsonObject {
         put("model", MODEL)
@@ -701,6 +708,7 @@ fun printHelp() = println(
       /help    Show this help
       /reset   Clear the conversation history
       /exit    Quit (or Ctrl+D)
+    Arrow keys edit the line; Up/Down recall earlier prompts (kept in ~/.agent_history).
     Ctrl+C cancels the running task; at the prompt it quits.
     Background jobs survive /reset and a cancelled task; they die with the session.
     Note: requests use store=true, so OpenAI retains this session for about 30 days.
@@ -756,7 +764,18 @@ private fun runOneShot(workspace: File, apiKey: String) {
 private fun runConsole(workspace: File, apiKey: String) {
     val events = LinkedBlockingQueue<Event>() // unbounded: put() runs on a job's watcher thread
     val harness = BashAgentHarness(workspace, apiKey) { events.put(Event.JobFinished) }
-    fun farewell() = println("\n👋 Bye! Session cost: \$%.4f".format(Locale.ROOT, harness.sessionCost()))
+
+    // JLine puts the tty in raw mode so arrow keys reach us as editing commands instead of
+    // escape sequences. It must be closed on every exit path or the shell inherits a broken tty.
+    val terminal = TerminalBuilder.builder().system(true).build()
+    val reader = LineReaderBuilder.builder()
+        .terminal(terminal)
+        .variable(LineReader.HISTORY_FILE, File(System.getProperty("user.home"), ".agent_history"))
+        .build()
+    fun farewell() {
+        println("\n👋 Bye! Session cost: \$%.4f".format(Locale.ROOT, harness.sessionCost()))
+        terminal.close()
+    }
 
     // Covers /exit, Ctrl+D and the exitProcess below.
     Runtime.getRuntime().addShutdownHook(thread(start = false) { harness.shutdown() })
@@ -768,24 +787,39 @@ private fun runConsole(workspace: File, apiKey: String) {
     println("🤖 Bash Agent — Workspace: ${workspace.absolutePath}")
     printHelp()
 
+    // readLine() paints the prompt while it runs, so it may only be active while we are actually
+    // waiting for the user — not while a task is streaming output. The main loop hands out one
+    // permit per prompt it wants; type-ahead during a task is dropped, as in most REPLs.
+    val wantLine = Semaphore(0)
     thread(isDaemon = true) {
         while (true) {
-            val line = readlnOrNull()
-            events.put(line?.let { Event.Typed(it) } ?: Event.EndOfInput)
-            if (line == null) break
+            wantLine.acquire()
+            val event = try {
+                Event.Typed(reader.readLine("\n👤 You: "))
+            } catch (_: EndOfFileException) {
+                Event.EndOfInput
+            } catch (_: UserInterruptException) { // Ctrl+C, if JLine intercepts it before our handler
+                Event.EndOfInput
+            }
+            events.put(event)
+            if (event == Event.EndOfInput) break
         }
     }
 
     var prompted = false // a wake-up with nothing to say leaves the prompt standing
     while (true) {
         if (!prompted) {
-            print("\n👤 You: ")
-            System.out.flush()
+            wantLine.release()
             prompted = true
         }
         when (val event = events.take()) {
             Event.EndOfInput -> break
-            Event.JobFinished -> if (harness.resume()) prompted = false
+            Event.JobFinished -> {
+                // resume() prints under a prompt that readLine is still holding on the other
+                // thread; redrawing is the only cross-thread call JLine supports for that.
+                if (harness.resume()) prompted = false
+                else runCatching { reader.callWidget(LineReader.REDRAW_LINE); reader.callWidget(LineReader.REDISPLAY) }
+            }
             is Event.Typed -> {
                 prompted = false
                 val line = event.line.trim()

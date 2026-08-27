@@ -33,7 +33,7 @@ class ApiProtocolTest : FunSpec({
             MockOpenAi().use { mock ->
                 mock.call()
                 val request = mock.requests.single()
-                request.json()["model"]!!.jsonPrimitive.content shouldBe "gpt-5"
+                request.json()["model"]!!.jsonPrimitive.content shouldBe MODEL
                 request.authorization shouldBe "Bearer test-key"
             }
         }
