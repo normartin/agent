@@ -484,8 +484,9 @@ fun trimHistory(input: MutableList<JsonObject>) {
     val limit = input.size - 1
     var drop = 1
     while (drop < limit && total > TRIM_TARGET_CHARS) total -= input[drop++].toString().length
-    // An orphaned function_call_output is a guaranteed 400.
-    while (drop < limit && input[drop].str("type") == "function_call_output") drop++
+    // Resume on a user message: anything else is orphaned from its function_call or reasoning item (400).
+    while (drop < limit && input[drop].str("role") != "user") drop++
+    if (drop >= limit) drop = 1
 
     if (drop > 1) {
         input.subList(1, drop).clear()

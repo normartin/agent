@@ -3,7 +3,6 @@ import io.kotest.matchers.collections.shouldContainExactly
 import io.kotest.matchers.comparables.shouldBeLessThanOrEqualTo
 import io.kotest.matchers.ints.shouldBeGreaterThan
 import io.kotest.matchers.shouldBe
-import io.kotest.matchers.shouldNotBe
 import io.kotest.property.Arb
 import io.kotest.property.arbitrary.int
 import io.kotest.property.checkAll
@@ -92,12 +91,23 @@ class TrimHistoryTest : FunSpec({
         input.last() shouldBe newest
     }
 
-    test("history never resumes on an orphaned function_call_output") {
-        // A function_call_output whose function_call was trimmed away is an
-        // orphan, and the API rejects the next request with a 400.
+    test("history always resumes on a user message") {
+        // Anything else is orphaned from its function_call or reasoning item: a 400.
         val input = session(turns = 40, pad = MAX_HISTORY_CHARS / 20)
         trimHistory(input)
-        input[1].str("type") shouldNotBe "function_call_output"
+        input[1].str("role") shouldBe "user"
+    }
+
+    test("a history with no turn boundary to resume on is left untouched") {
+        // Mid tool-loop every cut orphans something; over budget beats a 400.
+        val pad = MAX_HISTORY_CHARS
+        val input = mutableListOf(
+            roleMsg("system", "sys"), roleMsg("user", "task"), reasoning(),
+            functionCall(), functionCallOutput("x".repeat(pad))
+        )
+        val before = input.toList()
+        trimHistory(input)
+        input shouldContainExactly before
     }
 
     test("a single oversized item cannot empty the history") {
@@ -139,7 +149,7 @@ class TrimHistoryTest : FunSpec({
             input.first().str("role") shouldBe "system"
             input.last() shouldBe newest
             if (input.size > 1) {
-                input[1].str("type") shouldNotBe "function_call_output"
+                input[1].str("role") shouldBe "user"
             }
         }
     }
