@@ -15,8 +15,53 @@ class HarnessJobsTest : FunSpec({
 
     val workspace = tempdir()
 
+    fun captureStdout(block: () -> Unit): String {
+        val saved = System.out
+        val buffer = java.io.ByteArrayOutputStream()
+        System.setOut(java.io.PrintStream(buffer, true, Charsets.UTF_8))
+        try { block() } finally { System.setOut(saved) }
+        return buffer.toString(Charsets.UTF_8)
+    }
+
     /** What the harness sent on its [n]-th call, as one searchable string. */
     fun MockOpenAi.request(n: Int) = requests[n].body
+
+    test("strict-mode nulls and filler are harmless on run and wait") {
+        // Under strict every field is sent: null when the model follows the schema,
+        // "" / 120 when it does not (as the logged gpt-5.3-codex session did).
+        MockOpenAi().use { mock ->
+            mock.script(
+                Reply(200, actionCallBody("""{"action":"run","command":"echo one","name":null,"seconds":null}""", "call_1")),
+                Reply(200, actionCallBody("""{"action":"run","command":"echo two","name":"","seconds":120}""", "call_2")),
+                Reply(200, actionCallBody("""{"action":"start","command":"echo three","name":null,"seconds":null}""", "call_3")),
+                Reply(200, actionCallBody("""{"action":"wait","command":null,"name":"job1","seconds":null}""", "call_4")),
+                Reply(200, finalAnswerBody("done"))
+            )
+            val harness = BashAgentHarness(workspace, "test-key", mock.baseUrl)
+            harness.runTask("exercise the schema") shouldBe "done"
+
+            mock.request(1) shouldContain "one"
+            mock.request(1) shouldNotContain "Execution Error"
+            mock.request(2) shouldContain "two"
+            mock.request(2) shouldNotContain "Execution Error"
+            mock.request(3) shouldContain "Started background job \\\"job1\\\""
+            mock.request(4) shouldContain "three"
+            mock.request(4) shouldContain "[Exit Code: 0"
+            harness.shutdown()
+        }
+    }
+
+    test("a reasoning summary is printed and the item is still echoed back") {
+        MockOpenAi().use { mock ->
+            mock.script(Reply(200, reasoningSummaryBody("Look at the files")), Reply(200, finalAnswerBody("done")))
+            val harness = BashAgentHarness(workspace, "test-key", mock.baseUrl)
+            val printed = captureStdout { harness.runTask("go") }
+            printed shouldContain "🧠 Look at the files"
+            mock.request(1) shouldContain "\"summary_text\""
+            mock.request(1) shouldContain "rs_sum"
+            harness.shutdown()
+        }
+    }
 
     test("a finished job's output is delivered without the model asking") {
         MockOpenAi().use { mock ->

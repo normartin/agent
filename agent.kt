@@ -27,6 +27,8 @@ import kotlin.concurrent.thread
 import kotlin.system.exitProcess
 
 const val MODEL = "gpt-5.3-codex"
+// gpt-5.3-codex defaults to no reasoning at all; without this the reasoning items we echo back are empty.
+const val REASONING_EFFORT = "medium"
 
 // USD per 1M tokens; move with MODEL.
 const val INPUT_USD_PER_1M = 1.75
@@ -35,7 +37,9 @@ const val OUTPUT_USD_PER_1M = 14.00
 
 const val MAX_ITERATIONS = 15
 const val TIMEOUT_SECONDS = 120L       // foreground command deadline
-const val API_TIMEOUT_SECONDS = 120L   // one API call
+// One API call. Generous because a medium think over a big tool result runs minutes, and the request
+// in flight cannot be cancelled: Ctrl+C is felt between iterations and in the retry sleep only.
+const val API_TIMEOUT_SECONDS = 600L
 const val MAX_JOB_LOG_CHARS = 40_000   // held in memory per background job stream
 const val DEFAULT_WAIT_SECONDS = 60L
 const val MAX_WAIT_SECONDS = 600L
@@ -96,10 +100,14 @@ fun subAgentPrompt(depth: Int, command: String?): String {
 }
 
 // One tool, five actions: a single flat schema (Responses shape, no "function" wrapper) is resent every turn.
+// Strict mode is the Responses default, and it forces every property into "required" with no extras
+// allowed: sending it that way ourselves keeps the logged schema honest, and nullable optionals give the
+// model a legal way to leave a field out instead of inventing filler like "name":"" or "seconds":120.
 val TOOLS = buildJsonArray {
     addJsonObject {
         put("type", "function")
         put("name", "bash")
+        put("strict", true)
         put(
             "description",
             "Run a shell command in the workspace (killed after ${TIMEOUT_SECONDS}s), " +
@@ -107,27 +115,29 @@ val TOOLS = buildJsonArray {
         )
         putJsonObject("parameters") {
             put("type", "object")
+            put("additionalProperties", false)
+            putJsonArray("required") { add("action"); add("command"); add("name"); add("seconds") }
             putJsonObject("properties") {
                 putJsonObject("action") {
                     put("type", "string")
                     putJsonArray("enum") { add("run"); add("start"); add("output"); add("wait"); add("stop") }
                     put(
                         "description",
-                        "Default \"run\": execute 'command' and wait. start: run it in the background. " +
+                        "run: execute 'command' and wait. start: run it in the background. " +
                             "output: what a job has printed so far. wait: block until it finishes. stop: kill it."
                     )
                 }
                 putJsonObject("command") {
-                    put("type", "string")
-                    put("description", "Shell command; required for run and start.")
+                    putJsonArray("type") { add("string"); add("null") }
+                    put("description", "Shell command for run and start; null otherwise.")
                 }
                 putJsonObject("name") {
-                    put("type", "string")
-                    put("description", "Job name; required for stop, output and wait. Optional on start.")
+                    putJsonArray("type") { add("string"); add("null") }
+                    put("description", "Job name for stop, output and wait; optional on start; null for run.")
                 }
                 putJsonObject("seconds") {
-                    put("type", "number")
-                    put("description", "How long wait may block. Default $DEFAULT_WAIT_SECONDS, max $MAX_WAIT_SECONDS.")
+                    putJsonArray("type") { add("number"); add("null") }
+                    put("description", "wait only: how long it may block (default $DEFAULT_WAIT_SECONDS, max $MAX_WAIT_SECONDS). Null otherwise.")
                 }
             }
         }
@@ -147,6 +157,15 @@ data class Turn(
     /** The number to watch: mid-session it should sit high, and a sudden 0 means the prefix changed. */
     val cacheHitPercent: Int get() = if (promptTokens == 0L) 0 else (cachedPromptTokens * 100 / promptTokens).toInt()
 }
+
+/** What the model chose to say about its thinking: the "reasoning" items' summary parts. */
+fun reasoningSummary(output: JsonArray): String? = output
+    .map { it.jsonObject }
+    .filter { it.str("type") == "reasoning" }
+    .flatMap { it["summary"]?.jsonArray.orEmpty() }
+    .mapNotNull { it.jsonObject.str("text") }
+    .joinToString("\n")
+    .takeUnless { it.isBlank() }
 
 /** The assistant's prose, gathered from the "message" items' content parts. */
 fun assistantText(output: JsonArray): String? = output
@@ -268,6 +287,7 @@ class BashAgentHarness(
                 // Echo every output item back verbatim, reasoning included: that keeps gpt-5.x's thinking alive.
                 turn.output.forEach { input.add(it.jsonObject) }
 
+                reasoningSummary(turn.output)?.let { println("🧠 $it") }
                 val text = assistantText(turn.output)
                 val calls = turn.output.map { it.jsonObject }.filter { it.str("type") == "function_call" }
                 if (calls.isEmpty()) {
@@ -811,10 +831,12 @@ fun callOpenAI(
 ): Turn {
     // No temperature: gpt-5.x is a reasoning model. "store" stays at its default of true so the bare
     // reasoning ids we echo back stay resolvable; store=false needs include=["reasoning.encrypted_content"].
+    // The reasoning block is what makes those items non-empty; "summary" is what the 🧠 line prints.
     val payload = buildJsonObject {
         put("model", MODEL)
         put("input", JsonArray(input))
         put("tools", TOOLS)
+        putJsonObject("reasoning") { put("effort", REASONING_EFFORT); put("summary", "auto") }
         put("prompt_cache_key", PROMPT_CACHE_KEY)
         // The default cache lives 5-10 minutes; a user reading at the prompt easily outlasts that.
         put("prompt_cache_retention", "24h")

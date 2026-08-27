@@ -61,17 +61,46 @@ class ApiProtocolTest : FunSpec({
                 val parameters = bash["parameters"]!!.jsonObject
                 val properties = parameters["properties"]!!.jsonObject
                 properties.keys shouldBe setOf("action", "command", "name", "seconds")
-                properties["command"]!!.jsonObject["type"]!!.jsonPrimitive.content shouldBe "string"
 
                 properties["action"]!!.jsonObject["enum"]!!.jsonArray
                     .map { it.jsonPrimitive.content } shouldBe
                     listOf("run", "start", "output", "wait", "stop")
+            }
+        }
 
-                // Nothing is required: "run" needs only a command and the job
-                // actions only a name, and the schema cannot say "one or the
-                // other". Requiring "action" would also cost the commonest call
-                // in the loop a word it does not otherwise have to write.
-                parameters["required"] shouldBe null
+        test("the schema is strict-shaped: every field required, the optional ones nullable") {
+            // Strict is the Responses default and the API rewrites the schema that way
+            // regardless. Left implicit, the model had no legal way to omit a field and
+            // sent "name":"" and "seconds":120 on a plain run. Declaring it ourselves
+            // gives it null instead.
+            MockOpenAi().use { mock ->
+                mock.call()
+                val bash = mock.requests.single().json()["tools"]!!.jsonArray
+                    .map { it.jsonObject }.single { it.str("name") == "bash" }
+                bash["strict"]!!.jsonPrimitive.content shouldBe "true"
+
+                val parameters = bash["parameters"]!!.jsonObject
+                parameters["additionalProperties"]!!.jsonPrimitive.content shouldBe "false"
+                parameters["required"]!!.jsonArray.map { it.jsonPrimitive.content } shouldBe
+                    listOf("action", "command", "name", "seconds")
+
+                val properties = parameters["properties"]!!.jsonObject
+                fun types(name: String) = properties[name]!!.jsonObject["type"]!!.jsonArray.map { it.jsonPrimitive.content }
+                properties["action"]!!.jsonObject["type"]!!.jsonPrimitive.content shouldBe "string"
+                types("command") shouldBe listOf("string", "null")
+                types("name") shouldBe listOf("string", "null")
+                types("seconds") shouldBe listOf("number", "null")
+            }
+        }
+
+        test("asks for reasoning, with summaries") {
+            // gpt-5.3-codex defaults to effort "none": without this block the reasoning
+            // items the loop echoes back are empty and the whole mechanism is inert.
+            MockOpenAi().use { mock ->
+                mock.call()
+                val reasoning = mock.requests.single().json()["reasoning"]!!.jsonObject
+                reasoning["effort"]!!.jsonPrimitive.content shouldBe REASONING_EFFORT
+                reasoning["summary"]!!.jsonPrimitive.content shouldBe "auto"
             }
         }
 
@@ -151,6 +180,16 @@ class ApiProtocolTest : FunSpec({
                 val turn = mock.call()
                 assistantText(turn.output) shouldBe "all done"
                 turn.output.map { it.jsonObject.str("type") } shouldBe listOf("message")
+            }
+        }
+
+        test("reasoning summaries are gathered from the reasoning items") {
+            MockOpenAi().use { mock ->
+                mock.script(Reply(200, reasoningSummaryBody("Look at the files", "Then answer")))
+                val turn = mock.call()
+                reasoningSummary(turn.output) shouldBe "Look at the files\nThen answer"
+                // An empty summary array, the common case, is not "".
+                reasoningSummary(Json.parseToJsonElement(toolCallBody()).jsonObject["output"]!!.jsonArray) shouldBe null
             }
         }
 

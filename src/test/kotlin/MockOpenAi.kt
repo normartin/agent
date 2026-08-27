@@ -122,3 +122,20 @@ fun actionCallBody(arguments: String, callId: String = "call_jobs1") = """
   "usage": { "input_tokens": 10, "output_tokens": 5 }
 }
 """
+
+/** A tool-calling turn whose reasoning item carries summary text, as it does once summaries are requested. */
+fun reasoningSummaryBody(vararg summaries: String) = """
+{
+  "output": [
+    { "type": "reasoning", "id": "rs_sum", "summary": [${summaries.joinToString(",") { "{\"type\":\"summary_text\",\"text\":\"$it\"}" }}] },
+    {
+      "type": "function_call",
+      "id": "fc_sum",
+      "call_id": "call_sum",
+      "name": "bash",
+      "arguments": "{\"action\":\"run\",\"command\":\"echo hi\",\"name\":null,\"seconds\":null}"
+    }
+  ],
+  "usage": { "input_tokens": 10, "output_tokens": 5 }
+}
+"""
