@@ -55,254 +55,78 @@ val API_BASE = System.getenv("OPENAI_BASE_URL")?.trimEnd('/') ?: "https://api.op
 const val MAX_RETRIES = 5
 const val MAX_RETRY_WAIT_MS = 60_000L
 
-// ---------- 1. Command execution ----------
+// ---------- 1. What the model sees: system prompt and tool schema ----------
 
-/**
- * How to launch this very program again, for sub-agents. AGENT_CMD wins; otherwise it is rebuilt
- * from our own argv, which works for both the JBang script and the Gradle-installed launcher.
- * Null when neither is known, in which case the model is simply not offered sub-agents.
- */
-fun selfCommand(): String? {
-    System.getenv("AGENT_CMD")?.takeIf { it.isNotBlank() }?.let { return it }
-    val info = ProcessHandle.current().info()
-    val command = info.command().orElse(null) ?: return null
-    val args = info.arguments().orElse(null) ?: return null
-    return (listOf(command) + args).joinToString(" ") { "'" + it.replace("'", "'\\''") + "'" }
+/** What the model is told at item 0 of every request. Stable by design: the prompt cache keys on it. */
+fun systemPrompt(workspace: File, depth: Int = AGENT_DEPTH, subAgentCommand: String? = selfCommand()): String = """
+    You are a coding agent with a local bash shell via the "bash" tool. Working directory: ${workspace.absolutePath}
+    You are in an ongoing console conversation; keep earlier turns in mind. When the request is done, answer and stop.
+
+    Chain steps with && or a small script. A foreground command is killed after ${TIMEOUT_SECONDS}s and long output
+    is truncated in the middle, so never start a server that way. Slower things go in the background:
+      {"command":"ls -la"}                                       foreground (default)
+      {"action":"start","command":"./gradlew build","name":"build"}
+      {"action":"output","name":"server"}                        printed so far
+      {"action":"wait","name":"build","seconds":120}
+      {"action":"stop","name":"server"}
+    Never poll: a finished job's output is delivered as a [background job "name" finished] message, and each
+    user turn is preceded by a [background jobs still running] listing. Use "wait" only when you need the
+    result to answer. A finished job may hand you a turn without user input: report it and stop; fix it only
+    if it failed. Background jobs survive an interrupted task and die with the session.
+""".trimIndent() + subAgentPrompt(depth, subAgentCommand)
+
+/** Empty at the depth cap, so a child at the bottom of the chain is never shown the idea. */
+fun subAgentPrompt(depth: Int, command: String?): String {
+    if (command == null || depth >= MAX_AGENT_DEPTH) return ""
+    return "\n\n" + """
+        Sub-agents: for an independent, self-contained subtask, start a copy of yourself as a background job.
+        It has no memory of this conversation, so put everything it needs in the prompt. Its answer is
+        delivered when it finishes; redirect stderr or its progress log will crowd the answer out:
+          {"action":"start","command":"echo 'Count the lines in every .kt file and report the total' | $command 2>/dev/null","name":"count"}
+        Run several in parallel only on disjoint files: they share this working directory.
+    """.trimIndent()
 }
 
-/** Caps output, keeping head and tail: build failures land at the end. */
-fun truncate(text: String): String {
-    if (text.length <= MAX_OUTPUT_CHARS) return text
-    val head = text.take(MAX_OUTPUT_CHARS * 2 / 3)
-    val tail = text.takeLast(MAX_OUTPUT_CHARS / 3)
-    return "$head\n… [${text.length - head.length - tail.length} chars elided] …\n$tail"
-}
-
-/** Keeps the last [cap] chars a job printed; a background job has no deadline to stop it filling memory. */
-class BoundedLog(private val cap: Int = MAX_JOB_LOG_CHARS) {
-    private val buf = StringBuilder()
-    private var elided = 0L
-
-    @Synchronized
-    fun append(text: String) {
-        buf.append(text)
-        val drop = buf.length - cap
-        if (drop > 0) { buf.delete(0, drop); elided += drop }
-    }
-
-    @Synchronized
-    fun snapshot() = if (elided == 0L) buf.toString() else "… [$elided chars elided] …\n$buf"
-}
-
-enum class JobState { RUNNING, EXITED, KILLED }
-
-/** One command running detached from the turn that started it. Three daemon threads drain and reap it. */
-class BackgroundJob(
-    val name: String,
-    val command: String,
-    private val process: Process,
-    private val onFinished: (BackgroundJob) -> Unit = {}
-) {
-    val startedAt = System.currentTimeMillis()
-
-    @Volatile var state = JobState.RUNNING; private set
-    @Volatile var exitCode: Int? = null; private set
-    @Volatile private var finishedAt: Long? = null
-    /** Set once the finished job's output has reached the model. */
-    @Volatile var reported = false
-
-    val done get() = state != JobState.RUNNING
-    val elapsedSeconds get() = ((finishedAt ?: System.currentTimeMillis()) - startedAt) / 1000
-
-    // Declared before the threads: initialisers run in order.
-    private val out = BoundedLog()
-    private val err = BoundedLog()
-
-    // Daemons: a live job's pipes never close, and a non-daemon reader would keep the JVM up after main().
-    private val outDrain = thread(isDaemon = true) { drain(process.inputStream, out) }
-    private val errDrain = thread(isDaemon = true) { drain(process.errorStream, err) }
-    private val watcher = thread(isDaemon = true) {
-        process.waitFor()
-        outDrain.join(2000)
-        errDrain.join(2000)
-        finish(runCatching { process.exitValue() }.getOrNull())
-        onFinished(this)
-    }
-
-    private fun drain(stream: InputStream, log: BoundedLog) = runCatching {
-        stream.bufferedReader().use { reader ->
-            val buffer = CharArray(8192)
-            while (true) {
-                val read = reader.read(buffer)
-                if (read < 0) break
-                log.append(String(buffer, 0, read))
-            }
-        }
-    }
-
-    // Synchronised with stop(): otherwise a kill and a natural exit race to name the state.
-    @Synchronized
-    private fun finish(code: Int?) {
-        exitCode = code
-        if (state == JobState.RUNNING) state = JobState.EXITED
-        finishedAt = System.currentTimeMillis()
-    }
-
-    @Synchronized
-    fun stop() {
-        if (done) return
-        state = JobState.KILLED
-        // Descendants first, or a grandchild holds the pipes open.
-        process.descendants().forEach { it.destroyForcibly() }
-        process.destroyForcibly()
-    }
-
-    /** Waits until the job is over (log included), [seconds] pass, or [cancelled]. Polls so Ctrl+C is felt. */
-    fun await(seconds: Long, cancelled: () -> Boolean = { false }): Boolean {
-        val deadline = System.currentTimeMillis() + seconds * 1000
-        while (!cancelled()) {
-            val left = deadline - System.currentTimeMillis()
-            if (left <= 0) return false
-            if (process.waitFor(minOf(200L, left), TimeUnit.MILLISECONDS)) {
-                watcher.join(3000)
-                return true
-            }
-        }
-        return false
-    }
-
-    /** The output so far. [note] replaces the status line. */
-    fun report(note: String? = null) = buildString {
-        val stdout = out.snapshot()
-        val stderr = err.snapshot()
-        if (stdout.isNotBlank()) append(stdout)
-        if (stderr.isNotBlank()) append("ERROR OUTPUT:\n").append(stderr)
-        append("\n")
-        append(
-            note ?: when (state) {
-                JobState.RUNNING -> "[Still running after ${elapsedSeconds}s]"
-                JobState.KILLED -> "[Killed after ${elapsedSeconds}s]"
-                JobState.EXITED -> "[Exit Code: ${exitCode ?: "unknown"} after ${elapsedSeconds}s]"
-            }
+// One tool, five actions: a single flat schema (Responses shape, no "function" wrapper) is resent every turn.
+val TOOLS = buildJsonArray {
+    addJsonObject {
+        put("type", "function")
+        put("name", "bash")
+        put(
+            "description",
+            "Run a shell command in the workspace (killed after ${TIMEOUT_SECONDS}s), " +
+                "or manage a background job that outlives the turn and is referred to by name."
         )
-    }
-}
-
-/** Runs every command; only background jobs are registered by name. Finished jobs stay findable. */
-class JobRegistry(
-    private val workspace: File,
-    private val depth: Int = AGENT_DEPTH,
-    private val onFinished: (BackgroundJob) -> Unit = {} // last, so callers can pass a trailing lambda
-) {
-    private val jobs = LinkedHashMap<String, BackgroundJob>()
-    private var counter = 0
-    @Volatile private var foreground: BackgroundJob? = null
-
-    private fun launch(command: String) = ProcessBuilder("bash", "-c", command)
-        .directory(workspace)
-        .redirectInput(ProcessBuilder.Redirect.from(File("/dev/null"))) // no stdin: never block on input
-        .apply { environment()["AGENT_DEPTH"] = (depth + 1).toString() } // see MAX_AGENT_DEPTH
-        .start()
-
-    /** Starts [command] detached. Throws only if it will not launch. */
-    fun start(command: String, requested: String? = null): BackgroundJob {
-        val process = launch(command)
-        return synchronized(this) {
-            BackgroundJob(nameFor(requested), command, process, onFinished).also { jobs[it.name] = it }
-        }
-    }
-
-    /** Runs [command] and waits, killing it at [seconds]. Not registered and never wakes the console. */
-    fun run(command: String, seconds: Long, cancelled: () -> Boolean): BackgroundJob {
-        val job = BackgroundJob("foreground", command, launch(command))
-        foreground = job
-        try {
-            if (!job.await(seconds, cancelled)) { job.stop(); job.await(2) }
-            return job
-        } finally {
-            foreground = null
-        }
-    }
-
-    /** Called from the Ctrl+C handler. */
-    fun interruptForeground() { foreground?.stop() }
-
-    /** The model's own name when usable, never reused: a second "build" becomes "build-2". */
-    private fun nameFor(requested: String?): String {
-        val cleaned = requested.orEmpty().replace(Regex("[^A-Za-z0-9_.-]"), "-").trim('-', '.').take(40)
-        val base = cleaned.ifBlank { "job${++counter}" }
-        if (base !in jobs) return base
-        var suffix = 2
-        while ("$base-$suffix" in jobs) suffix++
-        return "$base-$suffix"
-    }
-
-    @Synchronized fun find(name: String) = jobs[name]
-    @Synchronized fun running() = jobs.values.filter { !it.done }
-    @Synchronized fun names() = jobs.keys.joinToString(", ").ifEmpty { "none" }
-    @Synchronized fun hasUndelivered() = jobs.values.any { it.done && !it.reported }
-
-    /** Finished jobs not yet handed to the model; each exactly once. */
-    @Synchronized
-    fun drainFinished() = jobs.values.filter { it.done && !it.reported }.onEach { it.reported = true }
-
-    fun killAll(): Int = running().onEach { it.stop() }.size
-}
-
-/** Drops the oldest turns past the budget. The system prompt and the newest item always survive. */
-fun trimHistory(input: MutableList<JsonObject>) {
-    var total = input.sumOf { it.toString().length }
-    if (total <= MAX_HISTORY_CHARS) return
-
-    val limit = input.size - 1
-    var drop = 1
-    while (drop < limit && total > MAX_HISTORY_CHARS) total -= input[drop++].toString().length
-    // An orphaned function_call_output is a guaranteed 400.
-    while (drop < limit && input[drop].str("type") == "function_call_output") drop++
-
-    if (drop > 1) {
-        input.subList(1, drop).clear()
-        println("🧹 Trimmed ${drop - 1} old item(s) to stay inside the context budget.")
-    }
-}
-
-/** Cached tokens are a subset of input tokens, so only the remainder bills at the full rate. */
-fun turnCost(input: Long, cached: Long, output: Long) =
-    (input - cached) / 1_000_000.0 * INPUT_USD_PER_1M +
-        cached / 1_000_000.0 * CACHED_INPUT_USD_PER_1M +
-        output / 1_000_000.0 * OUTPUT_USD_PER_1M
-
-/** A one-line "still working" indicator for the API call. Real terminals only; tests read stdout as text. */
-object Spinner {
-    // isTerminal(), not a null check: since JDK 22 System.console() exists even for a pipe.
-    private val enabled = System.console()?.isTerminal() == true
-    private var worker: Thread? = null
-
-    @Synchronized
-    fun start(text: String) {
-        if (!enabled || worker != null) return
-        val startedAt = System.currentTimeMillis()
-        worker = thread(isDaemon = true) {
-            var frame = 0
-            try {
-                while (true) {
-                    print("\r\u001B[2K${"⠹⠸⠴⠦⠇⠏"[frame++ % 6]} $text ${(System.currentTimeMillis() - startedAt) / 1000}s")
-                    Thread.sleep(90)
+        putJsonObject("parameters") {
+            put("type", "object")
+            putJsonObject("properties") {
+                putJsonObject("action") {
+                    put("type", "string")
+                    putJsonArray("enum") { add("run"); add("start"); add("output"); add("wait"); add("stop") }
+                    put(
+                        "description",
+                        "Default \"run\": execute 'command' and wait. start: run it in the background. " +
+                            "output: what a job has printed so far. wait: block until it finishes. stop: kill it."
+                    )
                 }
-            } catch (_: InterruptedException) {
-                print("\r\u001B[2K")
+                putJsonObject("command") {
+                    put("type", "string")
+                    put("description", "Shell command; required for run and start.")
+                }
+                putJsonObject("name") {
+                    put("type", "string")
+                    put("description", "Job name; required for stop, output and wait. Optional on start.")
+                }
+                putJsonObject("seconds") {
+                    put("type", "number")
+                    put("description", "How long wait may block. Default $DEFAULT_WAIT_SECONDS, max $MAX_WAIT_SECONDS.")
+                }
             }
         }
     }
-
-    @Synchronized
-    fun stop() {
-        worker?.apply { interrupt(); join() }
-        worker = null
-    }
 }
 
-// ---------- 2. Core agent harness loop ----------
+// ---------- 2. Agent loop ----------
 
 /** One model turn: the raw Responses output items and what they cost. */
 data class Turn(
@@ -343,36 +167,9 @@ class BashAgentHarness(
     private var cachedPromptTokens = 0L
     private var completionTokens = 0L
 
-    private val systemPrompt = """
-        You are a coding agent with a local bash shell via the "bash" tool. Working directory: ${workspace.absolutePath}
-        You are in an ongoing console conversation; keep earlier turns in mind. When the request is done, answer and stop.
-
-        Chain steps with && or a small script. A foreground command is killed after ${TIMEOUT_SECONDS}s and long output
-        is truncated in the middle, so never start a server that way. Slower things go in the background:
-          {"command":"ls -la"}                                       foreground (default)
-          {"action":"start","command":"./gradlew build","name":"build"}
-          {"action":"output","name":"server"}                        printed so far
-          {"action":"wait","name":"build","seconds":120}
-          {"action":"stop","name":"server"}
-        Never poll: a finished job's output is delivered as a [background job "name" finished] message, and each
-        user turn is preceded by a [background jobs still running] listing. Use "wait" only when you need the
-        result to answer. A finished job may hand you a turn without user input: report it and stop; fix it only
-        if it failed. Background jobs survive an interrupted task and die with the session.
-    """.trimIndent() + subAgentPrompt(depth, subAgentCommand)
+    private val systemPrompt = systemPrompt(workspace, depth, subAgentCommand)
 
     init { reset() }
-
-    /** Empty at the depth cap, so a child at the bottom of the chain is never shown the idea. */
-    private fun subAgentPrompt(depth: Int, command: String?): String {
-        if (command == null || depth >= MAX_AGENT_DEPTH) return ""
-        return "\n\n" + """
-            Sub-agents: for an independent, self-contained subtask, start a copy of yourself as a background job.
-            It has no memory of this conversation, so put everything it needs in the prompt. Its answer is
-            delivered when it finishes; redirect stderr or its progress log will crowd the answer out:
-              {"action":"start","command":"echo 'Count the lines in every .kt file and report the total' | $command 2>/dev/null","name":"count"}
-            Run several in parallel only on disjoint files: they share this working directory.
-        """.trimIndent()
-    }
 
     fun reset() {
         input.clear()
@@ -576,124 +373,30 @@ class BashAgentHarness(
     fun sessionCost() = turnCost(promptTokens, cachedPromptTokens, completionTokens)
 }
 
-// ---------- 3. HTTP and primitive JSON utils ----------
+/** Drops the oldest turns past the budget. The system prompt and the newest item always survive. */
+fun trimHistory(input: MutableList<JsonObject>) {
+    var total = input.sumOf { it.toString().length }
+    if (total <= MAX_HISTORY_CHARS) return
 
-fun JsonObject.str(key: String) = this[key]?.jsonPrimitive?.contentOrNull
-fun JsonObject?.long(key: String) = this?.get(key)?.jsonPrimitive?.longOrNull ?: 0L
-fun JsonObject?.obj(key: String) = this?.get(key) as? JsonObject
+    val limit = input.size - 1
+    var drop = 1
+    while (drop < limit && total > MAX_HISTORY_CHARS) total -= input[drop++].toString().length
+    // An orphaned function_call_output is a guaranteed 400.
+    while (drop < limit && input[drop].str("type") == "function_call_output") drop++
 
-/** Retry-After seconds plus a pad (landing on the window boundary earns another 429), else exponential. */
-fun retryDelayMs(response: HttpResponse<String>, attempt: Int): Long {
-    val hinted = response.headers().firstValue("retry-after").orElse(null)?.trim()?.toDoubleOrNull()
-    val delay = hinted?.let { (it * 1000).toLong() + 250 } ?: (1000L shl attempt)
-    return delay.coerceIn(250, MAX_RETRY_WAIT_MS)
-}
-
-/** Sleeps in slices so Ctrl+C is felt during a long wait. */
-fun sleepUnlessCancelled(totalMs: Long, cancelled: () -> Boolean): Boolean {
-    val deadline = System.currentTimeMillis() + totalMs
-    while (!cancelled()) {
-        val left = deadline - System.currentTimeMillis()
-        if (left <= 0) return true
-        Thread.sleep(minOf(200L, left))
-    }
-    return false
-}
-
-private fun HttpResponse<String>.toTurn(): Turn {
-    val json = Json.parseToJsonElement(body()).jsonObject
-    val output = json["output"]?.jsonArray
-        ?: throw Exception("API response did not contain an 'output' array: ${body()}")
-    val usage = json["usage"]?.jsonObject
-    return Turn(
-        output = output,
-        promptTokens = usage.long("input_tokens"),
-        cachedPromptTokens = usage.obj("input_tokens_details").long("cached_tokens"),
-        completionTokens = usage.long("output_tokens"),
-        reasoningTokens = usage.obj("output_tokens_details").long("reasoning_tokens")
-    )
-}
-
-// One tool, five actions: a single flat schema (Responses shape, no "function" wrapper) is resent every turn.
-val TOOLS = buildJsonArray {
-    addJsonObject {
-        put("type", "function")
-        put("name", "bash")
-        put(
-            "description",
-            "Run a shell command in the workspace (killed after ${TIMEOUT_SECONDS}s), " +
-                "or manage a background job that outlives the turn and is referred to by name."
-        )
-        putJsonObject("parameters") {
-            put("type", "object")
-            putJsonObject("properties") {
-                putJsonObject("action") {
-                    put("type", "string")
-                    putJsonArray("enum") { add("run"); add("start"); add("output"); add("wait"); add("stop") }
-                    put(
-                        "description",
-                        "Default \"run\": execute 'command' and wait. start: run it in the background. " +
-                            "output: what a job has printed so far. wait: block until it finishes. stop: kill it."
-                    )
-                }
-                putJsonObject("command") {
-                    put("type", "string")
-                    put("description", "Shell command; required for run and start.")
-                }
-                putJsonObject("name") {
-                    put("type", "string")
-                    put("description", "Job name; required for stop, output and wait. Optional on start.")
-                }
-                putJsonObject("seconds") {
-                    put("type", "number")
-                    put("description", "How long wait may block. Default $DEFAULT_WAIT_SECONDS, max $MAX_WAIT_SECONDS.")
-                }
-            }
-        }
+    if (drop > 1) {
+        input.subList(1, drop).clear()
+        println("🧹 Trimmed ${drop - 1} old item(s) to stay inside the context budget.")
     }
 }
 
-fun callOpenAI(
-    client: HttpClient,
-    input: List<JsonObject>,
-    apiKey: String,
-    baseUrl: String = API_BASE,
-    cancelled: () -> Boolean = { false }
-): Turn {
-    // No temperature: gpt-5.x is a reasoning model. "store" stays at its default of true so the bare
-    // reasoning ids we echo back stay resolvable; store=false needs include=["reasoning.encrypted_content"].
-    val payload = buildJsonObject {
-        put("model", MODEL)
-        put("input", JsonArray(input))
-        put("tools", TOOLS)
-    }.toString()
+/** Cached tokens are a subset of input tokens, so only the remainder bills at the full rate. */
+fun turnCost(input: Long, cached: Long, output: Long) =
+    (input - cached) / 1_000_000.0 * INPUT_USD_PER_1M +
+        cached / 1_000_000.0 * CACHED_INPUT_USD_PER_1M +
+        output / 1_000_000.0 * OUTPUT_USD_PER_1M
 
-    val request = HttpRequest.newBuilder()
-        .uri(URI.create("$baseUrl/v1/responses"))
-        .timeout(Duration.ofSeconds(API_TIMEOUT_SECONDS))
-        .header("Authorization", "Bearer $apiKey")
-        .header("Content-Type", "application/json")
-        .POST(HttpRequest.BodyPublishers.ofString(payload))
-        .build()
-
-    // Rate limits are normal weather for a loop that resends its history: wait them out.
-    var attempt = 0
-    while (true) {
-        val response = client.send(request, HttpResponse.BodyHandlers.ofString())
-        val status = response.statusCode()
-        if (status == 200) return response.toTurn()
-        if (status != 429 && status < 500) throw Exception("API Error [Status $status]: ${response.body()}")
-        if (attempt >= MAX_RETRIES) throw Exception("API Error [Status $status] after $MAX_RETRIES retries: ${response.body()}")
-
-        val waitMs = retryDelayMs(response, attempt++)
-        Spinner.stop()
-        println("⏳ %d from the API — retrying in %.1fs (attempt %d/%d)".format(Locale.ROOT, status, waitMs / 1000.0, attempt, MAX_RETRIES))
-        Spinner.start("Waiting")
-        if (!sleepUnlessCancelled(waitMs, cancelled)) throw Exception("Cancelled while waiting out a rate limit.")
-    }
-}
-
-// ---------- 4. Main entry point (interactive console, or one-shot on a pipe) ----------
+// ---------- 3. Entry points: interactive console, or one-shot on a pipe ----------
 
 /** The console waits on a queue, not stdin: a finishing job must be able to start a turn too. */
 private sealed interface Event {
@@ -834,4 +537,306 @@ private fun runConsole(workspace: File, apiKey: String) {
         }
     }
     farewell()
+}
+
+// ---------- 4. Command execution and background jobs ----------
+
+/**
+ * How to launch this very program again, for sub-agents. AGENT_CMD wins; otherwise it is rebuilt
+ * from our own argv, which works for both the JBang script and the Gradle-installed launcher.
+ * Null when neither is known, in which case the model is simply not offered sub-agents.
+ */
+fun selfCommand(): String? {
+    System.getenv("AGENT_CMD")?.takeIf { it.isNotBlank() }?.let { return it }
+    val info = ProcessHandle.current().info()
+    val command = info.command().orElse(null) ?: return null
+    val args = info.arguments().orElse(null) ?: return null
+    return (listOf(command) + args).joinToString(" ") { "'" + it.replace("'", "'\\''") + "'" }
+}
+
+/** Caps output, keeping head and tail: build failures land at the end. */
+fun truncate(text: String): String {
+    if (text.length <= MAX_OUTPUT_CHARS) return text
+    val head = text.take(MAX_OUTPUT_CHARS * 2 / 3)
+    val tail = text.takeLast(MAX_OUTPUT_CHARS / 3)
+    return "$head\n… [${text.length - head.length - tail.length} chars elided] …\n$tail"
+}
+
+/** Keeps the last [cap] chars a job printed; a background job has no deadline to stop it filling memory. */
+class BoundedLog(private val cap: Int = MAX_JOB_LOG_CHARS) {
+    private val buf = StringBuilder()
+    private var elided = 0L
+
+    @Synchronized
+    fun append(text: String) {
+        buf.append(text)
+        val drop = buf.length - cap
+        if (drop > 0) { buf.delete(0, drop); elided += drop }
+    }
+
+    @Synchronized
+    fun snapshot() = if (elided == 0L) buf.toString() else "… [$elided chars elided] …\n$buf"
+}
+
+enum class JobState { RUNNING, EXITED, KILLED }
+
+/** One command running detached from the turn that started it. Three daemon threads drain and reap it. */
+class BackgroundJob(
+    val name: String,
+    val command: String,
+    private val process: Process,
+    private val onFinished: (BackgroundJob) -> Unit = {}
+) {
+    val startedAt = System.currentTimeMillis()
+
+    @Volatile var state = JobState.RUNNING; private set
+    @Volatile var exitCode: Int? = null; private set
+    @Volatile private var finishedAt: Long? = null
+    /** Set once the finished job's output has reached the model. */
+    @Volatile var reported = false
+
+    val done get() = state != JobState.RUNNING
+    val elapsedSeconds get() = ((finishedAt ?: System.currentTimeMillis()) - startedAt) / 1000
+
+    // Declared before the threads: initialisers run in order.
+    private val out = BoundedLog()
+    private val err = BoundedLog()
+
+    // Daemons: a live job's pipes never close, and a non-daemon reader would keep the JVM up after main().
+    private val outDrain = thread(isDaemon = true) { drain(process.inputStream, out) }
+    private val errDrain = thread(isDaemon = true) { drain(process.errorStream, err) }
+    private val watcher = thread(isDaemon = true) {
+        process.waitFor()
+        outDrain.join(2000)
+        errDrain.join(2000)
+        finish(runCatching { process.exitValue() }.getOrNull())
+        onFinished(this)
+    }
+
+    private fun drain(stream: InputStream, log: BoundedLog) = runCatching {
+        stream.bufferedReader().use { reader ->
+            val buffer = CharArray(8192)
+            while (true) {
+                val read = reader.read(buffer)
+                if (read < 0) break
+                log.append(String(buffer, 0, read))
+            }
+        }
+    }
+
+    // Synchronised with stop(): otherwise a kill and a natural exit race to name the state.
+    @Synchronized
+    private fun finish(code: Int?) {
+        exitCode = code
+        if (state == JobState.RUNNING) state = JobState.EXITED
+        finishedAt = System.currentTimeMillis()
+    }
+
+    @Synchronized
+    fun stop() {
+        if (done) return
+        state = JobState.KILLED
+        // Descendants first, or a grandchild holds the pipes open.
+        process.descendants().forEach { it.destroyForcibly() }
+        process.destroyForcibly()
+    }
+
+    /** Waits until the job is over (log included), [seconds] pass, or [cancelled]. Polls so Ctrl+C is felt. */
+    fun await(seconds: Long, cancelled: () -> Boolean = { false }): Boolean {
+        val deadline = System.currentTimeMillis() + seconds * 1000
+        while (!cancelled()) {
+            val left = deadline - System.currentTimeMillis()
+            if (left <= 0) return false
+            if (process.waitFor(minOf(200L, left), TimeUnit.MILLISECONDS)) {
+                watcher.join(3000)
+                return true
+            }
+        }
+        return false
+    }
+
+    /** The output so far. [note] replaces the status line. */
+    fun report(note: String? = null) = buildString {
+        val stdout = out.snapshot()
+        val stderr = err.snapshot()
+        if (stdout.isNotBlank()) append(stdout)
+        if (stderr.isNotBlank()) append("ERROR OUTPUT:\n").append(stderr)
+        append("\n")
+        append(
+            note ?: when (state) {
+                JobState.RUNNING -> "[Still running after ${elapsedSeconds}s]"
+                JobState.KILLED -> "[Killed after ${elapsedSeconds}s]"
+                JobState.EXITED -> "[Exit Code: ${exitCode ?: "unknown"} after ${elapsedSeconds}s]"
+            }
+        )
+    }
+}
+
+/** Runs every command; only background jobs are registered by name. Finished jobs stay findable. */
+class JobRegistry(
+    private val workspace: File,
+    private val depth: Int = AGENT_DEPTH,
+    private val onFinished: (BackgroundJob) -> Unit = {} // last, so callers can pass a trailing lambda
+) {
+    private val jobs = LinkedHashMap<String, BackgroundJob>()
+    private var counter = 0
+    @Volatile private var foreground: BackgroundJob? = null
+
+    private fun launch(command: String) = ProcessBuilder("bash", "-c", command)
+        .directory(workspace)
+        .redirectInput(ProcessBuilder.Redirect.from(File("/dev/null"))) // no stdin: never block on input
+        .apply { environment()["AGENT_DEPTH"] = (depth + 1).toString() } // see MAX_AGENT_DEPTH
+        .start()
+
+    /** Starts [command] detached. Throws only if it will not launch. */
+    fun start(command: String, requested: String? = null): BackgroundJob {
+        val process = launch(command)
+        return synchronized(this) {
+            BackgroundJob(nameFor(requested), command, process, onFinished).also { jobs[it.name] = it }
+        }
+    }
+
+    /** Runs [command] and waits, killing it at [seconds]. Not registered and never wakes the console. */
+    fun run(command: String, seconds: Long, cancelled: () -> Boolean): BackgroundJob {
+        val job = BackgroundJob("foreground", command, launch(command))
+        foreground = job
+        try {
+            if (!job.await(seconds, cancelled)) { job.stop(); job.await(2) }
+            return job
+        } finally {
+            foreground = null
+        }
+    }
+
+    /** Called from the Ctrl+C handler. */
+    fun interruptForeground() { foreground?.stop() }
+
+    /** The model's own name when usable, never reused: a second "build" becomes "build-2". */
+    private fun nameFor(requested: String?): String {
+        val cleaned = requested.orEmpty().replace(Regex("[^A-Za-z0-9_.-]"), "-").trim('-', '.').take(40)
+        val base = cleaned.ifBlank { "job${++counter}" }
+        if (base !in jobs) return base
+        var suffix = 2
+        while ("$base-$suffix" in jobs) suffix++
+        return "$base-$suffix"
+    }
+
+    @Synchronized fun find(name: String) = jobs[name]
+    @Synchronized fun running() = jobs.values.filter { !it.done }
+    @Synchronized fun names() = jobs.keys.joinToString(", ").ifEmpty { "none" }
+    @Synchronized fun hasUndelivered() = jobs.values.any { it.done && !it.reported }
+
+    /** Finished jobs not yet handed to the model; each exactly once. */
+    @Synchronized
+    fun drainFinished() = jobs.values.filter { it.done && !it.reported }.onEach { it.reported = true }
+
+    fun killAll(): Int = running().onEach { it.stop() }.size
+}
+
+// ---------- 5. HTTP, retry and small utilities ----------
+
+fun callOpenAI(
+    client: HttpClient,
+    input: List<JsonObject>,
+    apiKey: String,
+    baseUrl: String = API_BASE,
+    cancelled: () -> Boolean = { false }
+): Turn {
+    // No temperature: gpt-5.x is a reasoning model. "store" stays at its default of true so the bare
+    // reasoning ids we echo back stay resolvable; store=false needs include=["reasoning.encrypted_content"].
+    val payload = buildJsonObject {
+        put("model", MODEL)
+        put("input", JsonArray(input))
+        put("tools", TOOLS)
+    }.toString()
+
+    val request = HttpRequest.newBuilder()
+        .uri(URI.create("$baseUrl/v1/responses"))
+        .timeout(Duration.ofSeconds(API_TIMEOUT_SECONDS))
+        .header("Authorization", "Bearer $apiKey")
+        .header("Content-Type", "application/json")
+        .POST(HttpRequest.BodyPublishers.ofString(payload))
+        .build()
+
+    // Rate limits are normal weather for a loop that resends its history: wait them out.
+    var attempt = 0
+    while (true) {
+        val response = client.send(request, HttpResponse.BodyHandlers.ofString())
+        val status = response.statusCode()
+        if (status == 200) return response.toTurn()
+        if (status != 429 && status < 500) throw Exception("API Error [Status $status]: ${response.body()}")
+        if (attempt >= MAX_RETRIES) throw Exception("API Error [Status $status] after $MAX_RETRIES retries: ${response.body()}")
+
+        val waitMs = retryDelayMs(response, attempt++)
+        Spinner.stop()
+        println("⏳ %d from the API — retrying in %.1fs (attempt %d/%d)".format(Locale.ROOT, status, waitMs / 1000.0, attempt, MAX_RETRIES))
+        Spinner.start("Waiting")
+        if (!sleepUnlessCancelled(waitMs, cancelled)) throw Exception("Cancelled while waiting out a rate limit.")
+    }
+}
+
+private fun HttpResponse<String>.toTurn(): Turn {
+    val json = Json.parseToJsonElement(body()).jsonObject
+    val output = json["output"]?.jsonArray
+        ?: throw Exception("API response did not contain an 'output' array: ${body()}")
+    val usage = json["usage"]?.jsonObject
+    return Turn(
+        output = output,
+        promptTokens = usage.long("input_tokens"),
+        cachedPromptTokens = usage.obj("input_tokens_details").long("cached_tokens"),
+        completionTokens = usage.long("output_tokens"),
+        reasoningTokens = usage.obj("output_tokens_details").long("reasoning_tokens")
+    )
+}
+
+/** Retry-After seconds plus a pad (landing on the window boundary earns another 429), else exponential. */
+fun retryDelayMs(response: HttpResponse<String>, attempt: Int): Long {
+    val hinted = response.headers().firstValue("retry-after").orElse(null)?.trim()?.toDoubleOrNull()
+    val delay = hinted?.let { (it * 1000).toLong() + 250 } ?: (1000L shl attempt)
+    return delay.coerceIn(250, MAX_RETRY_WAIT_MS)
+}
+
+/** Sleeps in slices so Ctrl+C is felt during a long wait. */
+fun sleepUnlessCancelled(totalMs: Long, cancelled: () -> Boolean): Boolean {
+    val deadline = System.currentTimeMillis() + totalMs
+    while (!cancelled()) {
+        val left = deadline - System.currentTimeMillis()
+        if (left <= 0) return true
+        Thread.sleep(minOf(200L, left))
+    }
+    return false
+}
+
+fun JsonObject.str(key: String) = this[key]?.jsonPrimitive?.contentOrNull
+fun JsonObject?.long(key: String) = this?.get(key)?.jsonPrimitive?.longOrNull ?: 0L
+fun JsonObject?.obj(key: String) = this?.get(key) as? JsonObject
+
+/** A one-line "still working" indicator for the API call. Real terminals only; tests read stdout as text. */
+object Spinner {
+    // isTerminal(), not a null check: since JDK 22 System.console() exists even for a pipe.
+    private val enabled = System.console()?.isTerminal() == true
+    private var worker: Thread? = null
+
+    @Synchronized
+    fun start(text: String) {
+        if (!enabled || worker != null) return
+        val startedAt = System.currentTimeMillis()
+        worker = thread(isDaemon = true) {
+            var frame = 0
+            try {
+                while (true) {
+                    print("\r\u001B[2K${"⠹⠸⠴⠦⠇⠏"[frame++ % 6]} $text ${(System.currentTimeMillis() - startedAt) / 1000}s")
+                    Thread.sleep(90)
+                }
+            } catch (_: InterruptedException) {
+                print("\r\u001B[2K")
+            }
+        }
+    }
+
+    @Synchronized
+    fun stop() {
+        worker?.apply { interrupt(); join() }
+        worker = null
+    }
 }
