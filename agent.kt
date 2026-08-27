@@ -30,7 +30,7 @@ import kotlin.concurrent.thread
 import kotlin.system.exitProcess
 
 const val MODEL = "gpt-5.3-codex"
-// gpt-5.3-codex defaults to no reasoning at all; without this the reasoning items we echo back are empty.
+// The model defaults to no reasoning; without this the echoed reasoning items are empty.
 const val REASONING_EFFORT = "medium"
 
 // USD per 1M tokens; move with MODEL.
@@ -40,47 +40,37 @@ const val OUTPUT_USD_PER_1M = 14.00
 
 const val MAX_ITERATIONS = 25
 const val TIMEOUT_SECONDS = 120L       // foreground command deadline
-// One API call. Generous because a medium think over a big tool result runs minutes, and the request
-// in flight cannot be cancelled: Ctrl+C is felt between iterations and in the retry sleep only.
+// One API call. A think over a big tool result runs minutes, and an in-flight request cannot be cancelled.
 const val API_TIMEOUT_SECONDS = 600L
-const val MAX_JOB_LOG_CHARS = 40_000   // held in memory per background job stream
+const val MAX_JOB_LOG_CHARS = 40_000   // per background job stream
 const val DEFAULT_WAIT_SECONDS = 60L
 const val MAX_WAIT_SECONDS = 600L
 
-// Sub-agents are this same program in one-shot mode, started as background jobs. Every job
-// inherits AGENT_DEPTH + 1, and the prompt stops offering the pattern at the cap, so a chain
-// of children cannot fork without bound.
+// Sub-agents are this program in one-shot mode. Jobs inherit AGENT_DEPTH + 1; at the cap the prompt stops offering them.
 const val MAX_AGENT_DEPTH = 2
 val AGENT_DEPTH = System.getenv("AGENT_DEPTH")?.toIntOrNull() ?: 0
 
-// Project instructions, read from the working directory once at startup and folded into the system
-// prompt. They belong in item 0: read once, they are stable turn to turn, so the prompt cache keeps
-// paying for them, whereas a per-turn message would push them behind the moving history.
+// Read once at startup into the system prompt: stable across turns, so the prompt cache covers them.
 val INSTRUCTION_FILES = listOf("CLAUDE.md", "AGENTS.md")
-// Per-file cap: the prompt is resent every iteration and counts against tokens-per-minute, cached or
-// not (see MAX_HISTORY_CHARS), and a runaway file must not eat the budget the conversation needs.
+// Per-file cap: the prompt is resent every iteration and counts against TPM even when cached.
 const val MAX_INSTRUCTIONS_CHARS = 20_000
 
-// Sized against tokens-per-minute, not the context window: the whole history is
-// resent every iteration and cached tokens still count against TPM.
+// Sized against TPM, not the context window: the whole history is resent every iteration.
 const val MAX_OUTPUT_CHARS = 6000
 const val MAX_HISTORY_CHARS = 120_000
-// Trimming rewrites the prefix right after item 0 and forfeits the prompt cache on everything behind
-// it, so cut deep and rarely: down to this, not merely under MAX_HISTORY_CHARS, or every turn past the
-// budget would drop one more item and miss the cache again.
+// Trimming forfeits the prompt cache behind the cut, so cut deep and rarely.
 const val TRIM_TARGET_CHARS = MAX_HISTORY_CHARS * 6 / 10
 
 val API_BASE = System.getenv("OPENAI_BASE_URL")?.trimEnd('/') ?: "https://api.openai.com"
 const val MAX_RETRIES = 5
 const val MAX_RETRY_WAIT_MS = 60_000L
 
-// One key per process: OpenAI routes a request to the cache node by this plus the prompt prefix, so
-// parallel sub-agents sharing a system prompt do not compete for the same node.
+// One key per process, so parallel sub-agents with the same prompt do not compete for one cache node.
 val PROMPT_CACHE_KEY = "agent-" + java.util.UUID.randomUUID()
 
 // ---------- 1. What the model sees: system prompt and tool schema ----------
 
-/** What the model is told at item 0 of every request. Stable by design: the prompt cache keys on it. */
+/** Item 0 of every request. Stable by design: the prompt cache keys on it. */
 fun systemPrompt(
     workspace: File,
     depth: Int = AGENT_DEPTH,
@@ -111,7 +101,7 @@ fun systemPrompt(
     tags (sed 's/<[^>]*>//g') and grep -C for what you need.
 """.trimIndent() + subAgentPrompt(depth, subAgentCommand) + instructionsPrompt(instructions)
 
-/** Last in the prompt, so the harness text ahead of it is the same in every project. */
+/** Last, so the harness text ahead of it is identical in every project. */
 fun instructionsPrompt(instructions: String): String =
     if (instructions.isBlank()) ""
     else "\n\nProject instructions, read from the working directory at startup. Follow them:\n\n$instructions"
@@ -120,18 +110,14 @@ fun instructionsPrompt(instructions: String): String =
 fun instructionFiles(workspace: File): List<File> =
     INSTRUCTION_FILES.map { File(workspace, it) }.filter { it.isFile }
 
-/**
- * The instruction files as one block, each under a "## name" heading so the model can tell them
- * apart, capped per file. An unreadable file is skipped: a permissions quirk in a checkout must not
- * stop the agent from starting.
- */
+/** One block, a "## name" heading per file, capped per file. Unreadable files are skipped, not fatal. */
 fun projectInstructions(workspace: File): String =
     instructionFiles(workspace).mapNotNull { file ->
         val text = runCatching { file.readText() }.getOrNull()?.trim() ?: return@mapNotNull null
         if (text.isEmpty()) null else "## ${file.name}\n" + truncate(text, MAX_INSTRUCTIONS_CHARS)
     }.joinToString("\n\n")
 
-/** Empty at the depth cap, so a child at the bottom of the chain is never shown the idea. */
+/** Empty at the depth cap, so the bottom child is never shown the idea. */
 fun subAgentPrompt(depth: Int, command: String?): String {
     if (command == null || depth >= MAX_AGENT_DEPTH) return ""
     return "\n\n" + """
@@ -143,10 +129,8 @@ fun subAgentPrompt(depth: Int, command: String?): String {
     """.trimIndent()
 }
 
-// One tool, five actions: a single flat schema (Responses shape, no "function" wrapper) is resent every turn.
-// Strict mode is the Responses default, and it forces every property into "required" with no extras
-// allowed: sending it that way ourselves keeps the logged schema honest, and nullable optionals give the
-// model a legal way to leave a field out instead of inventing filler like "name":"" or "seconds":120.
+// One tool, five actions, resent every turn. Strict requires every property, so optionals are nullable:
+// that gives the model a legal way to omit a field instead of inventing filler.
 val TOOLS = buildJsonArray {
     addJsonObject {
         put("type", "function")
@@ -190,7 +174,7 @@ val TOOLS = buildJsonArray {
 
 // ---------- 2. Agent loop ----------
 
-/** One model turn: the raw Responses output items and what they cost. */
+/** One model turn: the raw output items and what they cost. */
 data class Turn(
     val output: JsonArray,
     val promptTokens: Long,
@@ -198,11 +182,11 @@ data class Turn(
     val completionTokens: Long,
     val reasoningTokens: Long
 ) {
-    /** The number to watch: mid-session it should sit high, and a sudden 0 means the prefix changed. */
+    /** Mid-session this should sit high; a sudden 0 means the prefix changed. */
     val cacheHitPercent: Int get() = if (promptTokens == 0L) 0 else (cachedPromptTokens * 100 / promptTokens).toInt()
 }
 
-/** What the model chose to say about its thinking: the "reasoning" items' summary parts. */
+/** The "reasoning" items' summary parts. */
 fun reasoningSummary(output: JsonArray): String? = output
     .map { it.jsonObject }
     .filter { it.str("type") == "reasoning" }
@@ -211,7 +195,7 @@ fun reasoningSummary(output: JsonArray): String? = output
     .joinToString("\n")
     .takeUnless { it.isBlank() }
 
-/** The assistant's prose, gathered from the "message" items' content parts. */
+/** The "message" items' text parts. */
 fun assistantText(output: JsonArray): String? = output
     .map { it.jsonObject }
     .filter { it.str("type") == "message" }
@@ -223,19 +207,19 @@ fun assistantText(output: JsonArray): String? = output
 class BashAgentHarness(
     private val workspace: File,
     private val apiKey: String,
-    private val baseUrl: String = API_BASE,          // tests point this at a mock
+    private val baseUrl: String = API_BASE,
     private val timeoutSeconds: Long = TIMEOUT_SECONDS,
-    depth: Int = AGENT_DEPTH,                         // tests pin it; real runs read the environment
+    depth: Int = AGENT_DEPTH,
     subAgentCommand: String? = selfCommand(),
-    private val log: JsonlLog? = null,                // main wires AGENT_LOG; tests stay silent by default
-    onJobFinished: (BackgroundJob) -> Unit = {}       // last, so callers can pass it as a trailing lambda
+    private val log: JsonlLog? = null,
+    onJobFinished: (BackgroundJob) -> Unit = {}       // last, for trailing-lambda callers
 ) : AutoCloseable {
     private val jobs = JobRegistry(workspace, depth, log, onJobFinished)
     private val input = mutableListOf<JsonObject>()
     private val httpClient = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10)).build()
 
     @Volatile private var interrupted = false
-    /** True while a task runs, so Ctrl+C knows whether to cancel or quit. */
+    /** Tells Ctrl+C whether to cancel or quit. */
     @Volatile var busy = false; private set
 
     private var promptTokens = 0L
@@ -270,17 +254,17 @@ class BashAgentHarness(
         if (killed > 0) println("🛑 Killed $killed background job(s).")
     }
 
-    override fun close() = shutdown() // so a test's `use { }` cannot leak a job
+    override fun close() = shutdown()
 
     /** The model's final answer, or null when the task did not finish (API error, interrupt, iteration cap). */
     fun runTask(taskDescription: String): String? {
-        pumpJobs(announceRunning = true) // before the user's message, so their words come last
+        pumpJobs(announceRunning = true) // first, so the user's words come last
         input.add(message("user", taskDescription))
         log?.event("user") { put("text", taskDescription) }
         return runLoop()
     }
 
-    /** A turn nobody asked for, on the back of a finished job. False when the result already reached the model. */
+    /** A turn triggered by a finished job. False when its result already reached the model. */
     fun resume(): Boolean {
         if (!jobs.hasUndelivered()) return false
         println("\n🔔 A background job finished.")
@@ -288,10 +272,7 @@ class BashAgentHarness(
         return true
     }
 
-    /**
-     * Prints the answer here rather than in the callers: in one-shot mode System.out is already
-     * stderr by then, and the caller writes the returned text to the real stdout itself.
-     */
+    /** Prints the answer here: in one-shot mode System.out is stderr, and the caller owns the real stdout. */
     private fun runLoop(): String? {
         interrupted = false
         busy = true
@@ -331,7 +312,7 @@ class BashAgentHarness(
                     )
                 )
 
-                // Echo every output item back verbatim, reasoning included: that keeps gpt-5.x's thinking alive.
+                // Echoed back verbatim, reasoning included: that keeps the model's thinking alive.
                 turn.output.forEach { input.add(it.jsonObject) }
 
                 reasoningSummary(turn.output)?.let { println("🧠 $it") }
@@ -343,7 +324,7 @@ class BashAgentHarness(
                 }
                 if (text != null) println("🤔 Reasoning: $text")
 
-                // Every call needs a reply, even skipped ones: a missing one is a 400.
+                // Every call needs a reply, even skipped ones, or the next request is a 400.
                 calls.forEach { call -> runCall(call)?.let(input::add) }
             }
             println("\n⏹️ Stopped after $MAX_ITERATIONS iterations. Ask again to continue.")
@@ -355,7 +336,7 @@ class BashAgentHarness(
 
     /** Runs one function_call and builds its function_call_output. */
     private fun runCall(call: JsonObject): JsonObject? {
-        val id = call.str("call_id") ?: return null // "id" names the item; "call_id" is what a reply pairs with
+        val id = call.str("call_id") ?: return null // not "id": a reply pairs on call_id
         val rawArgs = call.str("arguments") ?: ""
         val args = runCatching { Json.parseToJsonElement(rawArgs).jsonObject }.getOrNull()
         log?.event("tool_call") {
@@ -418,7 +399,7 @@ class BashAgentHarness(
             "stop" -> withJob(name) { job ->
                 job.stop()
                 job.await(2)
-                job.reported = true // handed over here, so pumpJobs must not repeat it
+                job.reported = true // so pumpJobs does not repeat it
                 println("🛑 Stopped background job \"${job.name}\"")
                 "Stopped background job \"${job.name}\".\n${truncate(job.report())}"
             }
@@ -447,10 +428,7 @@ class BashAgentHarness(
         return block(job)
     }
 
-    /**
-     * Delivers finished jobs' output and, at a user turn, what is still running. Appended as plain
-     * messages, never folded into the system prompt: item 0 changing would forfeit the prompt cache.
-     */
+    /** Delivers finished jobs and, at a user turn, what still runs. As messages, never in item 0: the cache keys on it. */
     private fun pumpJobs(announceRunning: Boolean) {
         jobs.drainFinished().forEach { job ->
             val notice = "[background job \"${job.name}\" finished] ${job.command}\n${truncate(job.report())}"
@@ -478,10 +456,7 @@ class BashAgentHarness(
     fun sessionCost() = turnCost(promptTokens, cachedPromptTokens, completionTokens)
 }
 
-/**
- * Past the budget, drops the oldest turns down to TRIM_TARGET_CHARS. The system prompt and the
- * newest item always survive.
- */
+/** Past the budget, drops the oldest turns down to TRIM_TARGET_CHARS. Item 0 and the newest item survive. */
 fun trimHistory(input: MutableList<JsonObject>) {
     var total = input.sumOf { it.toString().length }
     if (total <= MAX_HISTORY_CHARS) return
@@ -489,7 +464,7 @@ fun trimHistory(input: MutableList<JsonObject>) {
     val limit = input.size - 1
     var drop = 1
     while (drop < limit && total > TRIM_TARGET_CHARS) total -= input[drop++].toString().length
-    // Resume on a user message: anything else is orphaned from its function_call or reasoning item (400).
+    // Resume on a user message: anything else is orphaned from its call or reasoning item (400).
     while (drop < limit && input[drop].str("role") != "user") drop++
     if (drop >= limit) drop = 1
 
@@ -499,7 +474,7 @@ fun trimHistory(input: MutableList<JsonObject>) {
     }
 }
 
-/** Cached tokens are a subset of input tokens, so only the remainder bills at the full rate. */
+/** Cached tokens are a subset of input tokens. */
 fun turnCost(input: Long, cached: Long, output: Long) =
     (input - cached) / 1_000_000.0 * INPUT_USD_PER_1M +
         cached / 1_000_000.0 * CACHED_INPUT_USD_PER_1M +
@@ -507,7 +482,7 @@ fun turnCost(input: Long, cached: Long, output: Long) =
 
 // ---------- 3. Entry points: interactive console, or one-shot on a pipe ----------
 
-/** The console waits on a queue, not stdin: a finishing job must be able to start a turn too. */
+/** A queue, not stdin: a finishing job must be able to start a turn too. */
 private sealed interface Event {
     data class Typed(val line: String) : Event
     data object EndOfInput : Event
@@ -541,26 +516,20 @@ fun main() {
     val workspace = File(".").apply { mkdirs() }.canonicalFile
     val log = resolveLogPath(System.getenv("AGENT_LOG"))?.let { JsonlLog(File(it)) }
 
-    // isTerminal(), not a null check: since JDK 22 System.console() exists even for a pipe.
+    // isTerminal(), not a null check: System.console() exists even for a pipe.
     if (System.console()?.isTerminal() == true) runConsole(workspace, apiKey, log) else runOneShot(workspace, apiKey, log)
 }
 
-/** AGENT_LOG: unset -> one file per session, blank -> off, otherwise the given path. */
-// Local zone: the name is for humans finding "the session from this morning".
+/** AGENT_LOG: unset -> one file per session (local time), blank -> off, otherwise the given path. */
 fun resolveLogPath(env: String?, now: Instant = Instant.now(), zone: ZoneId = ZoneId.systemDefault()): String? = when {
     env == null -> "agent-${ofPattern("yyyyMMdd-HHmmss").withZone(zone).format(now)}.jsonl"
     env.isBlank() -> null
     else -> env
 }
 
-/**
- * Non-interactive mode: all of stdin is the prompt, the answer is all that lands on stdout.
- * Exit code 0 = answered, 1 = did not finish, 2 = usage.
- */
+/** All of stdin is the prompt, only the answer lands on stdout. Exit 0 = answered, 1 = did not finish, 2 = usage. */
 private fun runOneShot(workspace: File, apiKey: String, log: JsonlLog?) {
-    // The harness prints progress with println throughout. Swapping System.out for stderr turns all
-    // of it into diagnostics without threading a logger through a single-file harness; the real
-    // stdout is kept aside for the one thing a caller pipes us for.
+    // Swapping System.out for stderr turns every println into diagnostics without plumbing a logger.
     val stdout = System.out
     System.setOut(System.err)
 
@@ -580,15 +549,14 @@ private fun runOneShot(workspace: File, apiKey: String, log: JsonlLog?) {
     if (answer == null) exitProcess(1)
     stdout.println(answer)
     stdout.flush()
-    exitProcess(0) // explicit: a background job's watcher thread would otherwise keep the JVM alive
+    exitProcess(0) // a job's watcher thread would otherwise keep the JVM alive
 }
 
 private fun runConsole(workspace: File, apiKey: String, log: JsonlLog?) {
-    val events = LinkedBlockingQueue<Event>() // unbounded: put() runs on a job's watcher thread
+    val events = LinkedBlockingQueue<Event>() // unbounded: put() runs on job threads
     val harness = BashAgentHarness(workspace, apiKey, log = log) { events.put(Event.JobFinished) }
 
-    // JLine puts the tty in raw mode so arrow keys reach us as editing commands instead of
-    // escape sequences. It must be closed on every exit path or the shell inherits a broken tty.
+    // Raw tty mode; must be closed on every exit path or the shell inherits a broken tty.
     val terminal = TerminalBuilder.builder().system(true).build()
     val reader = LineReaderBuilder.builder()
         .terminal(terminal)
@@ -599,7 +567,7 @@ private fun runConsole(workspace: File, apiKey: String, log: JsonlLog?) {
         terminal.close()
     }
 
-    // Covers /exit, Ctrl+D and the exitProcess below.
+    // Covers every exit path.
     Runtime.getRuntime().addShutdownHook(thread(start = false) { harness.shutdown() })
 
     Signal.handle(Signal("INT")) {
@@ -610,9 +578,7 @@ private fun runConsole(workspace: File, apiKey: String, log: JsonlLog?) {
     instructionsNotice(workspace)?.let { println(it) }
     printHelp()
 
-    // readLine() paints the prompt while it runs, so it may only be active while we are actually
-    // waiting for the user — not while a task is streaming output. The main loop hands out one
-    // permit per prompt it wants; type-ahead during a task is dropped, as in most REPLs.
+    // readLine() paints the prompt, so it must not overlap a task's output: one permit per prompt wanted.
     val wantLine = Semaphore(0)
     thread(isDaemon = true) {
         while (true) {
@@ -621,7 +587,7 @@ private fun runConsole(workspace: File, apiKey: String, log: JsonlLog?) {
                 Event.Typed(reader.readLine("\n👤 You: "))
             } catch (_: EndOfFileException) {
                 Event.EndOfInput
-            } catch (_: UserInterruptException) { // Ctrl+C, if JLine intercepts it before our handler
+            } catch (_: UserInterruptException) { // Ctrl+C caught by JLine before our handler
                 Event.EndOfInput
             }
             events.put(event)
@@ -629,7 +595,7 @@ private fun runConsole(workspace: File, apiKey: String, log: JsonlLog?) {
         }
     }
 
-    var prompted = false // a wake-up with nothing to say leaves the prompt standing
+    var prompted = false
     while (true) {
         if (!prompted) {
             wantLine.release()
@@ -638,8 +604,7 @@ private fun runConsole(workspace: File, apiKey: String, log: JsonlLog?) {
         when (val event = events.take()) {
             Event.EndOfInput -> break
             Event.JobFinished -> {
-                // resume() prints under a prompt that readLine is still holding on the other
-                // thread; redrawing is the only cross-thread call JLine supports for that.
+                // The prompt is still held by readLine on the other thread; redraw is the only cross-thread call JLine allows.
                 if (harness.resume()) prompted = false
                 else runCatching { reader.callWidget(LineReader.REDRAW_LINE); reader.callWidget(LineReader.REDISPLAY) }
             }
@@ -661,17 +626,11 @@ private fun runConsole(workspace: File, apiKey: String, log: JsonlLog?) {
 
 // ---------- 4. Command execution and background jobs ----------
 
-/**
- * How to launch this very program again, for sub-agents. AGENT_CMD wins; otherwise the local
- * JBang script path is enough in this repo and keeps the prompt short and stable.
- */
+/** How sub-agents launch this program. AGENT_CMD wins. */
 fun selfCommand(): String? =
     System.getenv("AGENT_CMD")?.takeIf { it.isNotBlank() } ?: "./agent.kt"
 
-/**
- * Which optional tools are on PATH, stated once in the prompt: probed at startup so the prompt stays
- * cache-stable, and told rather than left for the model to discover with a wasted call.
- */
+/** Optional tools on PATH, probed once at startup so the prompt stays cache-stable. */
 fun availableTools(names: List<String> = listOf("rg", "jq", "python3", "curl", "git", "gh")): String {
     val path = System.getenv("PATH").orEmpty().split(File.pathSeparator)
     val (have, missing) = names.partition { n -> path.any { File(it, n).canExecute() } }
@@ -679,7 +638,7 @@ fun availableTools(names: List<String> = listOf("rg", "jq", "python3", "curl", "
         (if (missing.isEmpty()) "." else " (no ${missing.joinToString(", no ")}).")
 }
 
-/** One line naming the instruction files that went into the prompt, or null when there are none. */
+/** Names the loaded instruction files, or null when there are none. */
 fun instructionsNotice(workspace: File): String? =
     instructionFiles(workspace).takeIf { it.isNotEmpty() }?.let { "📄 Instructions: " + it.joinToString(", ") { f -> f.name } }
 
@@ -692,10 +651,8 @@ fun truncate(text: String, limit: Int = MAX_OUTPUT_CHARS): String {
 }
 
 /**
- * Keeps the first [head] and the last [cap] chars a job printed; a background job has no deadline to
- * stop it filling memory. A tail alone is not enough: a build's first error and its summary sit at
- * opposite ends of the log, and the middle is downloads. [head] matches what [truncate] keeps, so the
- * model's head really is the start of the output rather than the start of the last 40k chars.
+ * Keeps the first [head] and last [cap] chars a job printed: a build's first error and its summary sit at
+ * opposite ends. [head] matches what [truncate] keeps, so the model sees the real start of the output.
  */
 class BoundedLog(private val cap: Int = MAX_JOB_LOG_CHARS, private val head: Int = MAX_OUTPUT_CHARS * 2 / 3) {
     private val first = StringBuilder()
@@ -711,15 +668,12 @@ class BoundedLog(private val cap: Int = MAX_JOB_LOG_CHARS, private val head: Int
         if (drop > 0) { buf.delete(0, drop); elided += drop }
     }
 
-    /** The marker sits between two real pieces of output, so [truncate] leaves both ends intact. */
+    /** The marker sits mid-output, so [truncate] leaves both ends intact. */
     @Synchronized
     fun snapshot() = if (elided == 0L) "$first$buf" else "$first\n… [$elided chars elided] …\n$buf"
 }
 
-/**
- * What a terminal would show: progress bars redraw a line with \r, and every frame kept verbatim
- * is budget the model pays for and cannot use (a Maven download log is mostly such frames).
- */
+/** What a terminal would show: progress bars redraw with \r, and every kept frame is wasted budget. */
 fun collapseCarriageReturns(text: String): String {
     if ('\r' !in text) return text
     return text.replace("\r\n", "\n").split('\n').joinToString("\n") { it.substringAfterLast('\r') }
@@ -727,7 +681,7 @@ fun collapseCarriageReturns(text: String): String {
 
 enum class JobState { RUNNING, EXITED, KILLED }
 
-/** One command running detached from the turn that started it. Three daemon threads drain and reap it. */
+/** One command detached from the turn that started it. Three daemon threads drain and reap it. */
 class BackgroundJob(
     val name: String,
     val command: String,
@@ -739,17 +693,17 @@ class BackgroundJob(
     @Volatile var state = JobState.RUNNING; private set
     @Volatile var exitCode: Int? = null; private set
     @Volatile private var finishedAt: Long? = null
-    /** Set once the finished job's output has reached the model. */
+    /** Output has reached the model. */
     @Volatile var reported = false
 
     val done get() = state != JobState.RUNNING
     val elapsedSeconds get() = ((finishedAt ?: System.currentTimeMillis()) - startedAt) / 1000
 
-    // Declared before the threads: initialisers run in order.
+    // Before the threads: initialisers run in order.
     private val out = BoundedLog()
     private val err = BoundedLog()
 
-    // Daemons: a live job's pipes never close, and a non-daemon reader would keep the JVM up after main().
+    // Daemons: a live job's pipes never close and would keep the JVM up after main().
     private val outDrain = thread(isDaemon = true) { drain(process.inputStream, out) }
     private val errDrain = thread(isDaemon = true) { drain(process.errorStream, err) }
     private val watcher = thread(isDaemon = true) {
@@ -771,7 +725,7 @@ class BackgroundJob(
         }
     }
 
-    // Synchronised with stop(): otherwise a kill and a natural exit race to name the state.
+    // Synchronised with stop(): a kill and a natural exit race to name the state.
     @Synchronized
     private fun finish(code: Int?) {
         exitCode = code
@@ -788,7 +742,7 @@ class BackgroundJob(
         process.destroyForcibly()
     }
 
-    /** Waits until the job is over (log included), [seconds] pass, or [cancelled]. Polls so Ctrl+C is felt. */
+    /** Waits until the job is over (log included), [seconds] pass, or [cancelled]. */
     fun await(seconds: Long, cancelled: () -> Boolean = { false }): Boolean {
         val deadline = System.currentTimeMillis() + seconds * 1000
         while (!cancelled()) {
@@ -804,7 +758,7 @@ class BackgroundJob(
 
     /** The output so far. [note] replaces the status line. */
     fun report(note: String? = null) = buildString {
-        // Collapsed here, at read time, because a \r-delimited frame can straddle two drain chunks.
+        // At read time: a \r frame can straddle two drain chunks.
         val stdout = collapseCarriageReturns(out.snapshot())
         val stderr = collapseCarriageReturns(err.snapshot())
         if (stdout.isNotBlank()) append(stdout)
@@ -820,12 +774,12 @@ class BackgroundJob(
     }
 }
 
-/** Runs every command; only background jobs are registered by name. Finished jobs stay findable. */
+/** Runs every command; only background jobs are registered by name, and stay findable when done. */
 class JobRegistry(
     private val workspace: File,
     private val depth: Int = AGENT_DEPTH,
-    private val log: JsonlLog? = null,                    // children append to the same file, see AGENT_LOG
-    private val onFinished: (BackgroundJob) -> Unit = {} // last, so callers can pass a trailing lambda
+    private val log: JsonlLog? = null,
+    private val onFinished: (BackgroundJob) -> Unit = {} // last, for trailing-lambda callers
 ) {
     private val jobs = LinkedHashMap<String, BackgroundJob>()
     private var counter = 0
@@ -833,14 +787,14 @@ class JobRegistry(
 
     private fun launch(command: String) = ProcessBuilder("bash", "-c", command)
         .directory(workspace)
-        .redirectInput(ProcessBuilder.Redirect.from(File("/dev/null"))) // no stdin: never block on input
+        .redirectInput(ProcessBuilder.Redirect.from(File("/dev/null"))) // never block on input
         .apply {
-            environment()["AGENT_DEPTH"] = (depth + 1).toString() // see MAX_AGENT_DEPTH
-            environment()["AGENT_LOG"] = log?.path ?: "" // absolute, so a child that cd's still finds it; "" = off
+            environment()["AGENT_DEPTH"] = (depth + 1).toString()
+            environment()["AGENT_LOG"] = log?.path ?: "" // absolute, so a child that cd's still finds it
         }
         .start()
 
-    /** Starts [command] detached. Throws only if it will not launch. */
+    /** Throws only if [command] will not launch. */
     fun start(command: String, requested: String? = null): BackgroundJob {
         val process = launch(command)
         return synchronized(this) {
@@ -848,7 +802,7 @@ class JobRegistry(
         }
     }
 
-    /** Runs [command] and waits, killing it at [seconds]. Not registered and never wakes the console. */
+    /** Runs [command] and waits, killing it at [seconds]. Not registered. */
     fun run(command: String, seconds: Long, cancelled: () -> Boolean): BackgroundJob {
         val job = BackgroundJob("foreground", command, launch(command))
         foreground = job
@@ -860,10 +814,9 @@ class JobRegistry(
         }
     }
 
-    /** Called from the Ctrl+C handler. */
     fun interruptForeground() { foreground?.stop() }
 
-    /** The model's own name when usable, never reused: a second "build" becomes "build-2". */
+    /** Never reused: a second "build" becomes "build-2". */
     private fun nameFor(requested: String?): String {
         val cleaned = requested.orEmpty().replace(Regex("[^A-Za-z0-9_.-]"), "-").trim('-', '.').take(40)
         val base = cleaned.ifBlank { "job${++counter}" }
@@ -878,7 +831,7 @@ class JobRegistry(
     @Synchronized fun names() = jobs.keys.joinToString(", ").ifEmpty { "none" }
     @Synchronized fun hasUndelivered() = jobs.values.any { it.done && !it.reported }
 
-    /** Finished jobs not yet handed to the model; each exactly once. */
+    /** Each finished job exactly once. */
     @Synchronized
     fun drainFinished() = jobs.values.filter { it.done && !it.reported }.onEach { it.reported = true }
 
@@ -887,10 +840,7 @@ class JobRegistry(
 
 // ---------- 5. HTTP, retry and small utilities ----------
 
-/**
- * One JSON object per line, appended and flushed immediately: a crash mid-turn must not lose the
- * request that caused it. Synchronized because a job's watcher thread logs alongside the main loop.
- */
+/** Flushed per line: a crash mid-turn must not lose the request that caused it. Job threads log too. */
 class JsonlLog(file: File) {
     val path: String = file.absolutePath
     private val writer = java.io.FileWriter(File(path).apply { parentFile?.mkdirs() }, Charsets.UTF_8, true).buffered()
@@ -918,16 +868,15 @@ fun callOpenAI(
     cancelled: () -> Boolean = { false },
     log: JsonlLog? = null
 ): Turn {
-    // No temperature: gpt-5.x is a reasoning model. "store" stays at its default of true so the bare
-    // reasoning ids we echo back stay resolvable; store=false needs include=["reasoning.encrypted_content"].
-    // The reasoning block is what makes those items non-empty; "summary" is what the 🧠 line prints.
+    // "store" stays true so the echoed reasoning ids stay resolvable (store=false needs
+    // include=["reasoning.encrypted_content"]). "summary" feeds the 🧠 line.
     val payload = buildJsonObject {
         put("model", MODEL)
         put("input", JsonArray(input))
         put("tools", TOOLS)
         putJsonObject("reasoning") { put("effort", REASONING_EFFORT); put("summary", "auto") }
         put("prompt_cache_key", PROMPT_CACHE_KEY)
-        // The default cache lives 5-10 minutes; a user reading at the prompt easily outlasts that.
+        // The default retention is minutes; a user idle at the prompt outlasts that.
         put("prompt_cache_retention", "24h")
     }
     val url = "$baseUrl/v1/responses"
@@ -940,10 +889,10 @@ fun callOpenAI(
         .POST(HttpRequest.BodyPublishers.ofString(payload.toString()))
         .build()
 
-    // Rate limits are normal weather for a loop that resends its history: wait them out.
+    // Rate limits are routine for a loop that resends its history: wait them out.
     var attempt = 0
     while (true) {
-        // The body goes in as JSON, not as a string, so jq can dig into it; only the header carries the key.
+        // JSON, not a string, so jq can dig into it; the key lives in the header only.
         log?.event("request") { put("attempt", attempt); put("url", url); put("body", payload) }
         val started = System.nanoTime()
         val response = client.send(request, HttpResponse.BodyHandlers.ofString())
@@ -981,14 +930,14 @@ private fun HttpResponse<String>.toTurn(): Turn {
     )
 }
 
-/** Retry-After seconds plus a pad (landing on the window boundary earns another 429), else exponential. */
+/** Retry-After plus a pad (the window boundary earns another 429), else exponential. */
 fun retryDelayMs(retryAfter: String?, attempt: Int): Long {
     val hinted = retryAfter?.trim()?.toDoubleOrNull()
     val delay = hinted?.let { (it * 1000).toLong() + 250 } ?: (1000L shl attempt)
     return delay.coerceIn(250, MAX_RETRY_WAIT_MS)
 }
 
-/** Sleeps in slices so Ctrl+C is felt during a long wait. */
+/** Sliced so Ctrl+C is felt. */
 fun sleepUnlessCancelled(totalMs: Long, cancelled: () -> Boolean): Boolean {
     val deadline = System.currentTimeMillis() + totalMs
     while (!cancelled()) {
@@ -1003,9 +952,9 @@ fun JsonObject.str(key: String) = this[key]?.jsonPrimitive?.contentOrNull
 fun JsonObject?.long(key: String) = this?.get(key)?.jsonPrimitive?.longOrNull ?: 0L
 fun JsonObject?.obj(key: String) = this?.get(key) as? JsonObject
 
-/** A one-line "still working" indicator for the API call. Real terminals only; tests read stdout as text. */
+/** Real terminals only; tests read stdout as text. */
 object Spinner {
-    // isTerminal(), not a null check: since JDK 22 System.console() exists even for a pipe.
+    // isTerminal(), not a null check: System.console() exists even for a pipe.
     private val enabled = System.console()?.isTerminal() == true
     private var worker: Thread? = null
 
