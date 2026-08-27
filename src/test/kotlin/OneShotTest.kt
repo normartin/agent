@@ -8,6 +8,7 @@ import io.kotest.matchers.string.shouldNotContain
  * One-shot mode prints whatever runTask returns and turns null into a
  * non-zero exit, so the return value is the contract worth pinning.
  */
+@io.kotest.core.annotation.Isolate // swaps System.out
 class OneShotTest : FunSpec({
 
     val workspace = tempdir()
@@ -19,6 +20,20 @@ class OneShotTest : FunSpec({
                 turn(answer("all done"))
             )
             BashAgentHarness(workspace, "test-key", mock.baseUrl).runTask("say hi") shouldBe "all done"
+        }
+    }
+
+    test("echoAnswer = false keeps the answer off the console, so one-shot prints it once") {
+        MockOpenAi().use { mock ->
+            mock.script(turn(answer("all done")))
+            val saved = System.out
+            val buffer = java.io.ByteArrayOutputStream()
+            System.setOut(java.io.PrintStream(buffer, true, Charsets.UTF_8))
+            val answer = try {
+                BashAgentHarness(workspace, "test-key", mock.baseUrl, echoAnswer = false).runTask("say hi")
+            } finally { System.setOut(saved) }
+            answer shouldBe "all done"
+            buffer.toString(Charsets.UTF_8) shouldNotContain "all done"
         }
     }
 

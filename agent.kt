@@ -1,5 +1,6 @@
 ///usr/bin/env jbang "$0" "$@" ; exit $?
 //JAVA 21+
+//JAVA_OPTIONS --enable-native-access=ALL-UNNAMED
 //KOTLIN 2.4.10
 //DEPS org.jetbrains.kotlin:kotlin-stdlib:2.4.10
 //DEPS org.jetbrains.kotlinx:kotlinx-serialization-json:1.7.3
@@ -210,6 +211,7 @@ class BashAgentHarness(
     depth: Int = AGENT_DEPTH,
     subAgentCommand: String? = selfCommand(),
     private val log: JsonlLog? = null,
+    private val echoAnswer: Boolean = true,           // false in one-shot: stdout gets the answer itself
     onJobFinished: (BackgroundJob) -> Unit = {}       // last, for trailing-lambda callers
 ) : AutoCloseable {
     private val jobs = JobRegistry(workspace, depth, log, onJobFinished)
@@ -313,7 +315,8 @@ class BashAgentHarness(
                 val text = assistantText(turn.output)
                 val calls = turn.output.map { it.jsonObject }.filter { it.str("type") == "function_call" }
                 if (calls.isEmpty()) {
-                    println("\n✅  ${text ?: "(the model returned neither an answer nor a command)"}")
+                    if (text == null) println("\n✅  (the model returned neither an answer nor a command)")
+                    else if (echoAnswer) println("\n✅  $text")
                     return text ?: ""
                 }
                 if (text != null) println("🤔  Reasoning: $text")
@@ -540,13 +543,12 @@ private fun runOneShot(workspace: File, apiKey: String, log: JsonlLog?) {
         exitProcess(2)
     }
 
-    val harness = BashAgentHarness(workspace, apiKey, log = log)
+    val harness = BashAgentHarness(workspace, apiKey, log = log, echoAnswer = false)
     Runtime.getRuntime().addShutdownHook(thread(start = false) { harness.shutdown() })
     Signal.handle(Signal("INT")) { harness.interrupt() }
     instructionsNotice(workspace)?.let { System.err.println(it) }
 
-    val answer = harness.runTask(prompt)
-    System.err.println("Session cost: \$%.4f".format(Locale.ROOT, harness.sessionCost()))
+    val answer = harness.runTask(prompt) // the 📊 line already reports the session cost
     if (answer == null) exitProcess(1)
     stdout.println(answer)
     stdout.flush()

@@ -32,6 +32,8 @@ tasks.named<KotlinCompile>("compileKotlin") {
 application {
     // Top-level main() in the root package.
     mainClass = "AgentKt"
+    // JLine's FFM terminal calls restricted native methods; silence the JDK warning.
+    applicationDefaultJvmArgs = listOf("--enable-native-access=ALL-UNNAMED")
 }
 
 dependencies {

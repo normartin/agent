@@ -12,7 +12,7 @@ The code should stay short and readable. If new features required signigificantl
   (`./agent.kt`); `build.gradle.kts` points the main source set at just this file.
 - `src/test/kotlin/` — Kotest tests, including `MockOpenAi.kt`, an in-process
   stand-in for the API (JDK `HttpServer`, no extra deps).
-- `agent_workspace/` — scratch dir the agent runs commands in. Gitignored.
+- The agent runs commands in the cwd it is started from. `agent_workspace/` is a gitignored scratch dir for trying it out.
 
 ## Commands
 
