@@ -15,8 +15,8 @@ class OneShotTest : FunSpec({
     test("runTask returns the model's final answer") {
         MockOpenAi().use { mock ->
             mock.script(
-                Reply(200, toolCallBody(command = "echo hi")),
-                Reply(200, finalAnswerBody("all done"))
+                turn(reasoning(), bash(command = "echo hi")),
+                turn(answer("all done"))
             )
             BashAgentHarness(workspace, "test-key", mock.baseUrl).runTask("say hi") shouldBe "all done"
         }
@@ -35,44 +35,47 @@ class SubAgentDepthTest : FunSpec({
 
     val workspace = tempdir()
 
+    /** Item 0 of the [n]-th request: the system prompt. */
+    fun MockOpenAi.systemPrompt(n: Int) = requests[n].input[0].str("content")!!
+
     test("a background job sees AGENT_DEPTH one deeper than its parent") {
         MockOpenAi().use { mock ->
             mock.script(
-                Reply(200, toolCallBody(command = "echo depth=\$AGENT_DEPTH")),
-                Reply(200, finalAnswerBody("ok"))
+                turn(reasoning(), bash(command = "echo depth=\$AGENT_DEPTH")),
+                turn(answer("ok"))
             )
             BashAgentHarness(workspace, "test-key", mock.baseUrl, depth = 1).runTask("what depth?")
-            mock.requests[1].body shouldContain "depth=2"
+            mock.requests[1].input.last().str("output")!! shouldContain "depth=2"
         }
     }
 
     test("the sub-agent pattern is offered below the cap and withheld at it") {
         MockOpenAi().use { mock ->
-            mock.script(Reply(200, finalAnswerBody("ok")), Reply(200, finalAnswerBody("ok")))
+            mock.script(turn(answer("ok")), turn(answer("ok")))
             BashAgentHarness(workspace, "test-key", mock.baseUrl, depth = 0, subAgentCommand = "/opt/agent").runTask("hi")
             BashAgentHarness(workspace, "test-key", mock.baseUrl, depth = MAX_AGENT_DEPTH, subAgentCommand = "/opt/agent").runTask("hi")
-            mock.requests[0].body shouldContain "/opt/agent 2>/dev/null"
-            mock.requests[1].body shouldNotContain "Sub-agents"
+            mock.systemPrompt(0) shouldContain "/opt/agent 2>/dev/null"
+            mock.systemPrompt(1) shouldNotContain "Sub-agents"
         }
     }
 
     test("a background job inherits the parent's log file") {
         MockOpenAi().use { mock ->
             mock.script(
-                Reply(200, toolCallBody(command = "echo log=\$AGENT_LOG")),
-                Reply(200, finalAnswerBody("ok"))
+                turn(reasoning(), bash(command = "echo log=\$AGENT_LOG")),
+                turn(answer("ok"))
             )
             val log = JsonlLog(java.io.File(workspace, "session.jsonl"))
             BashAgentHarness(workspace, "test-key", mock.baseUrl, log = log).runTask("what log?")
-            mock.requests[1].body shouldContain "log=${log.path}"
+            mock.requests[1].input.last().str("output")!! shouldContain "log=${log.path}"
         }
     }
 
     test("no launch command means no sub-agent offer") {
         MockOpenAi().use { mock ->
-            mock.script(Reply(200, finalAnswerBody("ok")))
+            mock.script(turn(answer("ok")))
             BashAgentHarness(workspace, "test-key", mock.baseUrl, depth = 0, subAgentCommand = null).runTask("hi")
-            mock.requests[0].body shouldNotContain "Sub-agents"
+            mock.systemPrompt(0) shouldNotContain "Sub-agents"
         }
     }
 })

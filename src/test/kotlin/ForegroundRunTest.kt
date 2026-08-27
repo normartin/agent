@@ -63,8 +63,7 @@ class ForegroundRunTest : FunSpec({
         elapsedMs shouldBeLessThan 15_000L
         job.state shouldBe JobState.KILLED
 
-        awaitNoProcesses(marker)
-        processesMatching(marker) shouldBe 0
+        shouldLeaveNoProcess(marker)
     }
 
     test("an interrupt is felt during the command, not after it") {
@@ -85,8 +84,7 @@ class ForegroundRunTest : FunSpec({
         runner.isAlive shouldBe false
         job!!.state shouldBe JobState.KILLED
 
-        awaitNoProcesses(marker)
-        processesMatching(marker) shouldBe 0
+        shouldLeaveNoProcess(marker)
     }
 
     test("a foreground command is never registered as a job") {
@@ -105,30 +103,26 @@ class ForegroundRunTest : FunSpec({
         // unanswered function_call is a 400 on the very next request.
         MockOpenAi().use { mock ->
             mock.script(
-                Reply(200, toolCallBody(command = "echo hi")),
-                Reply(200, finalAnswerBody("gave up"))
+                turn(reasoning(), bash(command = "echo hi")),
+                turn(answer("gave up"))
             )
-            val harness = BashAgentHarness(java.io.File("/no/such/directory"), "test-key", mock.baseUrl)
-            harness.runTask("run something")
+            BashAgentHarness(java.io.File("/no/such/directory"), "test-key", mock.baseUrl).use { it.runTask("run something") }
 
-            mock.requests[1].body shouldContain "Execution Error"
+            mock.requests[1].input.last().str("output")!! shouldStartWith "Execution Error"
         }
     }
 
     test("the timeout wording reaches the model") {
         MockOpenAi().use { mock ->
             mock.script(
-                Reply(200, toolCallBody(command = "sleep 300")),
-                Reply(200, finalAnswerBody("that took too long"))
+                turn(reasoning(), bash(command = "sleep 300")),
+                turn(answer("that took too long"))
             )
-            val harness = BashAgentHarness(workspace, "test-key", mock.baseUrl, timeoutSeconds = 2)
-            harness.runTask("hang")
+            BashAgentHarness(workspace, "test-key", mock.baseUrl, timeoutSeconds = 2).use { it.runTask("hang") }
 
             // "[Killed after 2s]" is what the job itself would say, which does
             // not tell the model whether it was the deadline or the user.
-            mock.requests[1].body shouldContain "TIMED OUT after 2s"
-
-            harness.shutdown()
+            mock.requests[1].input.last().str("output")!! shouldContain "TIMED OUT after 2s"
         }
     }
 })

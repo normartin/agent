@@ -15,7 +15,7 @@ class JsonlLogTest : FunSpec({
 
     test("a tool-call turn logs the whole conversation in order, with the request body as JSON") {
         MockOpenAi().use { mock ->
-            mock.script(Reply(200, toolCallBody(command = "echo hi")), Reply(200, finalAnswerBody("all done")))
+            mock.script(turn(reasoning(), bash(command = "echo hi")), turn(answer("all done")))
             val file = File(workspace, "log/agent.jsonl")
             BashAgentHarness(workspace, "test-key", mock.baseUrl, log = JsonlLog(file)).runTask("say hi") shouldBe "all done"
 
@@ -37,7 +37,7 @@ class JsonlLogTest : FunSpec({
 
     test("a 429 leaves a retry line between two request/response pairs") {
         MockOpenAi().use { mock ->
-            mock.script(rateLimited(), Reply(200, finalAnswerBody("ok")))
+            mock.script(rateLimited(), turn(answer("ok")))
             val file = File(workspace, "retry.jsonl")
             BashAgentHarness(workspace, "test-key", mock.baseUrl, log = JsonlLog(file)).runTask("hello") shouldBe "ok"
 

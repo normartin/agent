@@ -1,3 +1,5 @@
+import io.kotest.matchers.shouldBe
+
 /**
  * Counts processes whose command line carries [marker].
  *
@@ -12,13 +14,14 @@ fun processesMatching(marker: String): Int {
 }
 
 /**
- * Waits for every process carrying [marker] to be gone. Polls rather than
+ * Asserts that every process carrying [marker] is gone. Polls first rather than
  * sleeping a fixed spell: a killed process lingers as a zombie until its parent
  * reaps it, and pgrep counts zombies.
  */
-fun awaitNoProcesses(marker: String, timeoutMs: Long = 10_000) {
+fun shouldLeaveNoProcess(marker: String, timeoutMs: Long = 10_000) {
     val deadline = System.currentTimeMillis() + timeoutMs
     while (processesMatching(marker) > 0 && System.currentTimeMillis() < deadline) {
         Thread.sleep(100)
     }
+    processesMatching(marker) shouldBe 0
 }

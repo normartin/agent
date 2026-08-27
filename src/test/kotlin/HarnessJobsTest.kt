@@ -2,7 +2,7 @@ import io.kotest.core.spec.style.FunSpec
 import io.kotest.engine.spec.tempdir
 import io.kotest.matchers.shouldBe
 import io.kotest.matchers.string.shouldContain
-import io.kotest.matchers.string.shouldNotContain
+import io.kotest.matchers.string.shouldStartWith
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 
@@ -23,43 +23,41 @@ class HarnessJobsTest : FunSpec({
         return buffer.toString(Charsets.UTF_8)
     }
 
-    /** What the harness sent on its [n]-th call, as one searchable string. */
-    fun MockOpenAi.request(n: Int) = requests[n].body
+    /** The tool result the harness sent on its [n]-th request: the last input item, a function_call_output. */
+    fun MockOpenAi.toolResult(n: Int) = requests[n].input.last().str("output")!!
 
     test("strict-mode nulls and filler are harmless on run and wait") {
         // Under strict every field is sent: null when the model follows the schema,
         // "" / 120 when it does not (as the logged gpt-5.3-codex session did).
         MockOpenAi().use { mock ->
             mock.script(
-                Reply(200, actionCallBody("""{"action":"run","command":"echo one","name":null,"seconds":null}""", "call_1")),
-                Reply(200, actionCallBody("""{"action":"run","command":"echo two","name":"","seconds":120}""", "call_2")),
-                Reply(200, actionCallBody("""{"action":"start","command":"echo three","name":null,"seconds":null}""", "call_3")),
-                Reply(200, actionCallBody("""{"action":"wait","command":null,"name":"job1","seconds":null}""", "call_4")),
-                Reply(200, finalAnswerBody("done"))
+                turn(reasoning(), bash(action = "run", command = "echo one")),
+                turn(reasoning(), bashRaw("""{"action":"run","command":"echo two","name":"","seconds":120}""")),
+                turn(reasoning(), bash(action = "start", command = "echo three")),
+                turn(reasoning(), bash(action = "wait", name = "job1")),
+                turn(answer("done"))
             )
-            val harness = BashAgentHarness(workspace, "test-key", mock.baseUrl)
-            harness.runTask("exercise the schema") shouldBe "done"
-
-            mock.request(1) shouldContain "one"
-            mock.request(1) shouldNotContain "Execution Error"
-            mock.request(2) shouldContain "two"
-            mock.request(2) shouldNotContain "Execution Error"
-            mock.request(3) shouldContain "Started background job \\\"job1\\\""
-            mock.request(4) shouldContain "three"
-            mock.request(4) shouldContain "[Exit Code: 0"
-            harness.shutdown()
+            BashAgentHarness(workspace, "test-key", mock.baseUrl).use { harness ->
+                harness.runTask("exercise the schema") shouldBe "done"
+            }
+            mock.toolResult(1) shouldStartWith "one\n"
+            mock.toolResult(2) shouldStartWith "two\n"
+            mock.toolResult(3) shouldStartWith "Started background job \"job1\""
+            mock.toolResult(4) shouldStartWith "three\n"
+            mock.toolResult(4) shouldContain "[Exit Code: 0"
         }
     }
 
     test("a reasoning summary is printed and the item is still echoed back") {
         MockOpenAi().use { mock ->
-            mock.script(Reply(200, reasoningSummaryBody("Look at the files")), Reply(200, finalAnswerBody("done")))
-            val harness = BashAgentHarness(workspace, "test-key", mock.baseUrl)
-            val printed = captureStdout { harness.runTask("go") }
-            printed shouldContain "🧠 Look at the files"
-            mock.request(1) shouldContain "\"summary_text\""
-            mock.request(1) shouldContain "rs_sum"
-            harness.shutdown()
+            mock.script(
+                turn(reasoning("Look at the files"), bash(command = "echo hi")),
+                turn(answer("done"))
+            )
+            BashAgentHarness(workspace, "test-key", mock.baseUrl).use { harness ->
+                captureStdout { harness.runTask("go") } shouldContain "🧠 Look at the files"
+            }
+            mock.requests[1].input.single { it.str("type") == "reasoning" } shouldBe reasoning("Look at the files")
         }
     }
 
@@ -68,47 +66,39 @@ class HarnessJobsTest : FunSpec({
             mock.script(
                 // Start something short, then spend a turn in the foreground so
                 // it is certainly over by the time the third request is built.
-                Reply(200, actionCallBody("""{"action":"start","command":"echo ingested","name":"probe"}""")),
-                Reply(200, toolCallBody(command = "sleep 2")),
-                Reply(200, finalAnswerBody("done"))
+                turn(reasoning(), bash(action = "start", command = "echo ingested", name = "probe")),
+                turn(reasoning(), bash(command = "sleep 2")),
+                turn(answer("done"))
             )
-            val harness = BashAgentHarness(workspace, "test-key", mock.baseUrl)
-            harness.runTask("run something in the background")
+            BashAgentHarness(workspace, "test-key", mock.baseUrl).use { it.runTask("run something in the background") }
 
             mock.requests.size shouldBe 3
-            // Nothing has been delivered on the turn that started it: no
-            // command has produced any output at all yet.
-            mock.request(1) shouldNotContain "[Exit Code"
+            // Nothing is delivered on the request right after the start: the job has not run yet.
+            mock.requests[1].input.count { it.str("content")?.startsWith("[background job") == true } shouldBe 0
 
-            val delivered = mock.request(2)
-            delivered shouldContain "[background job "
-            delivered shouldContain "probe"
-            delivered shouldContain "ingested"
-            delivered shouldContain "[Exit Code: 0"
-
-            harness.shutdown()
+            val delivered = mock.requests[2].input.last()
+            delivered.str("role") shouldBe "user"
+            delivered.str("content")!! shouldStartWith "[background job \"probe\" finished] echo ingested\ningested\n\n[Exit Code: 0"
         }
     }
 
     test("each user turn is preceded by what is still running") {
         MockOpenAi().use { mock ->
             mock.script(
-                Reply(200, actionCallBody("""{"action":"start","command":"sleep 30","name":"server"}""")),
-                Reply(200, finalAnswerBody("started it")),
-                Reply(200, finalAnswerBody("still going"))
+                turn(reasoning(), bash(action = "start", command = "sleep 30", name = "server")),
+                turn(answer("started it")),
+                turn(answer("still going"))
             )
-            val harness = BashAgentHarness(workspace, "test-key", mock.baseUrl)
-            harness.runTask("start a server")
-            harness.runTask("how is it doing?")
+            BashAgentHarness(workspace, "test-key", mock.baseUrl).use { harness ->
+                harness.runTask("start a server")
+                harness.runTask("how is it doing?")
+            }
 
-            val second = mock.request(2)
-            second shouldContain "[background jobs still running]"
-            second shouldContain "\\\"server\\\""
-            second shouldContain "sleep 30"
-            // The user's own words stay the last thing the model reads.
-            second.indexOf("how is it doing?") shouldBe second.lastIndexOf("how is it doing?")
-
-            harness.shutdown()
+            // The listing comes first; the user's own words stay the last thing the model reads.
+            val (listing, question) = mock.requests[2].input.takeLast(2).map { it.str("content")!! }
+            listing shouldStartWith "[background jobs still running]\n- \"server\" ("
+            listing shouldContain "): sleep 30"
+            question shouldBe "how is it doing?"
         }
     }
 
@@ -116,39 +106,35 @@ class HarnessJobsTest : FunSpec({
         val marker = "kotest-harness-stop-marker"
         MockOpenAi().use { mock ->
             mock.script(
-                Reply(200, actionCallBody("""{"action":"start","command":"sleep 300 # $marker","name":"hog"}""")),
-                Reply(200, actionCallBody("""{"action":"stop","name":"hog"}""", callId = "call_jobs2")),
-                Reply(200, finalAnswerBody("stopped"))
+                turn(reasoning(), bash(action = "start", command = "sleep 300 # $marker", name = "hog")),
+                turn(reasoning(), bash(action = "stop", name = "hog", callId = "call_2")),
+                turn(answer("stopped"))
             )
-            val harness = BashAgentHarness(workspace, "test-key", mock.baseUrl)
-            harness.runTask("start it, then stop it")
+            BashAgentHarness(workspace, "test-key", mock.baseUrl).use { it.runTask("start it, then stop it") }
 
             // The stop's own reply carries the result, so it must not also be
-            // delivered as a finished job on the next turn — exactly one copy.
-            mock.request(2).split("[Killed after").size shouldBe 2
+            // delivered as a finished job: exactly one copy.
+            val items = mock.requests[2].input
+            items.last().str("output")!! shouldContain "[Killed after"
+            items.count { it.str("content")?.startsWith("[background job") == true } shouldBe 0
 
-            awaitNoProcesses(marker)
-            processesMatching(marker) shouldBe 0
-            harness.shutdown()
+            shouldLeaveNoProcess(marker)
         }
     }
 
     test("an unusable job action is answered rather than left dangling") {
         MockOpenAi().use { mock ->
             mock.script(
-                Reply(200, actionCallBody("""{"action":"wait","name":"ghost"}""")),
-                Reply(200, actionCallBody("""{"action":"start"}""", callId = "call_jobs2")),
-                Reply(200, finalAnswerBody("gave up"))
+                turn(reasoning(), bash(action = "wait", name = "ghost")),
+                turn(reasoning(), bash(action = "start", callId = "call_2")),
+                turn(answer("gave up"))
             )
-            val harness = BashAgentHarness(workspace, "test-key", mock.baseUrl)
-            harness.runTask("wait for a job that does not exist")
+            BashAgentHarness(workspace, "test-key", mock.baseUrl).use { it.runTask("wait for a job that does not exist") }
 
             // An unanswered function_call is a 400 on the very next request, so
             // every branch has to produce an output item.
-            mock.request(1) shouldContain "no background job named"
-            mock.request(2) shouldContain "'start' needs a 'command'"
-
-            harness.shutdown()
+            mock.toolResult(1) shouldContain "no background job named \"ghost\""
+            mock.toolResult(2) shouldContain "'start' needs a 'command'"
         }
     }
 
@@ -157,78 +143,57 @@ class HarnessJobsTest : FunSpec({
         test("resume runs a turn the user never asked for and delivers the result") {
             MockOpenAi().use { mock ->
                 mock.script(
-                    Reply(200, actionCallBody("""{"action":"start","command":"echo woke-you-up","name":"alarm"}""")),
-                    Reply(200, finalAnswerBody("started it")),
-                    Reply(200, finalAnswerBody("the job printed woke-you-up"))
+                    turn(reasoning(), bash(action = "start", command = "echo woke-you-up", name = "alarm")),
+                    turn(answer("started it")),
+                    turn(answer("the job printed woke-you-up"))
                 )
                 // The console learns a job is over exactly this way.
                 val finished = CountDownLatch(1)
-                val harness = BashAgentHarness(workspace, "test-key", mock.baseUrl) { finished.countDown() }
-                harness.runTask("start it")
-                mock.requests.size shouldBe 2
+                BashAgentHarness(workspace, "test-key", mock.baseUrl) { finished.countDown() }.use { harness ->
+                    harness.runTask("start it")
+                    mock.requests.size shouldBe 2
 
-                finished.await(15, TimeUnit.SECONDS) shouldBe true
-                harness.resume() shouldBe true
+                    finished.await(15, TimeUnit.SECONDS) shouldBe true
+                    harness.resume() shouldBe true
+                }
 
                 mock.requests.size shouldBe 3
-                val unprompted = mock.request(2)
-                unprompted shouldContain "[background job "
-                unprompted shouldContain "woke-you-up"
-
-                harness.shutdown()
+                mock.requests[2].input.last().str("content")!! shouldStartWith "[background job \"alarm\" finished] echo woke-you-up\nwoke-you-up\n\n[Exit Code: 0"
             }
         }
 
         test("resume spends nothing when the result already reached the model") {
             MockOpenAi().use { mock ->
                 mock.script(
-                    Reply(200, actionCallBody("""{"action":"start","command":"echo quick","name":"quick"}""")),
-                    Reply(200, toolCallBody(command = "sleep 2")),
-                    Reply(200, finalAnswerBody("done"))
+                    turn(reasoning(), bash(action = "start", command = "echo quick", name = "quick")),
+                    turn(reasoning(), bash(command = "sleep 2")),
+                    turn(answer("done"))
                 )
-                val harness = BashAgentHarness(workspace, "test-key", mock.baseUrl)
-                harness.runTask("start it and hang about")
+                BashAgentHarness(workspace, "test-key", mock.baseUrl).use { harness ->
+                    harness.runTask("start it and hang about")
 
-                // The task that was running delivered the result itself, so the
-                // notification that follows has nothing left to say.
-                mock.requests.size shouldBe 3
-                harness.resume() shouldBe false
-                mock.requests.size shouldBe 3
-
-                harness.shutdown()
+                    // The task that was running delivered the result itself, so the
+                    // notification that follows has nothing left to say.
+                    mock.requests.size shouldBe 3
+                    harness.resume() shouldBe false
+                    mock.requests.size shouldBe 3
+                }
             }
         }
 
         test("a job the model stopped does not wake anyone") {
             MockOpenAi().use { mock ->
                 mock.script(
-                    Reply(200, actionCallBody("""{"action":"start","command":"sleep 300","name":"doomed"}""")),
-                    Reply(200, actionCallBody("""{"action":"stop","name":"doomed"}""", callId = "call_jobs2")),
-                    Reply(200, finalAnswerBody("stopped"))
+                    turn(reasoning(), bash(action = "start", command = "sleep 300", name = "doomed")),
+                    turn(reasoning(), bash(action = "stop", name = "doomed", callId = "call_2")),
+                    turn(answer("stopped"))
                 )
-                val harness = BashAgentHarness(workspace, "test-key", mock.baseUrl)
-                harness.runTask("start it, then stop it")
-
-                harness.resume() shouldBe false
+                BashAgentHarness(workspace, "test-key", mock.baseUrl).use { harness ->
+                    harness.runTask("start it, then stop it")
+                    harness.resume() shouldBe false
+                }
                 mock.requests.size shouldBe 3
             }
-        }
-
-        test("the notification fires once per job, whatever ended it") {
-            val fired = java.util.concurrent.CopyOnWriteArrayList<String>()
-            val jobs = JobRegistry(workspace) { fired.add(it.name) }
-
-            val quick = jobs.start("echo done", "quick")
-            val killed = jobs.start("sleep 300", "killed")
-            quick.await(15) shouldBe true
-
-            killed.stop()
-            killed.await(15) shouldBe true
-            // A moment for the watcher, which fires the callback after it has
-            // published the state.
-            Thread.sleep(500)
-
-            fired.sorted() shouldBe listOf("killed", "quick")
         }
     }
 
@@ -236,17 +201,16 @@ class HarnessJobsTest : FunSpec({
         val marker = "kotest-harness-shutdown-marker"
         MockOpenAi().use { mock ->
             mock.script(
-                Reply(200, actionCallBody("""{"action":"start","command":"sleep 300 & sleep 300 # $marker"}""")),
-                Reply(200, finalAnswerBody("running"))
+                turn(reasoning(), bash(action = "start", command = "sleep 300 & sleep 300 # $marker")),
+                turn(answer("running"))
             )
             val harness = BashAgentHarness(workspace, "test-key", mock.baseUrl)
             harness.runTask("start a long one")
 
-            Thread.sleep(500)
+            Thread.sleep(500) // let bash fork the background child before we go after descendants
             harness.shutdown()
 
-            awaitNoProcesses(marker)
-            processesMatching(marker) shouldBe 0
+            shouldLeaveNoProcess(marker)
         }
     }
 })

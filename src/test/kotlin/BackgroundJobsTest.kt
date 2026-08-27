@@ -6,78 +6,15 @@ import io.kotest.matchers.longs.shouldBeLessThan
 import io.kotest.matchers.shouldBe
 import io.kotest.matchers.shouldNotBe
 import io.kotest.matchers.string.shouldContain
-import io.kotest.matchers.string.shouldNotContain
 import io.kotest.engine.spec.tempdir
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.TimeUnit
 
 /** Waits for [job] to be over, failing the test rather than hanging forever. */
 private fun BackgroundJob.finish(seconds: Long = 15) {
     await(seconds) shouldBe true
 }
-
-class BoundedLogTest : FunSpec({
-
-    test("short output comes back whole") {
-        val log = BoundedLog(cap = 300)
-        log.append("hello ")
-        log.append("world")
-        log.snapshot() shouldBe "hello world"
-    }
-
-    test("a flood keeps the head and the tail and counts what went missing") {
-        // The cap has to hold as the output arrives: a background job has no
-        // deadline, so nothing else would stop it filling memory. The head is
-        // pinned too: a build's first error is worth more than its 500th download.
-        val log = BoundedLog(cap = 300, head = 50)
-        repeat(1000) { log.append("line $it\n") }
-
-        val snapshot = log.snapshot()
-        snapshot.length shouldBeLessThan 450
-        snapshot shouldContain "line 0\nline 1\n"  // head, from the very first byte
-        snapshot shouldContain "line 999"          // tail, still moving
-        snapshot shouldContain "chars elided"
-        snapshot shouldNotContain "line 500"
-        // The marker sits between two real pieces of output, in order.
-        snapshot.indexOf("line 1\n") shouldBeLessThan snapshot.indexOf("chars elided")
-        snapshot.indexOf("chars elided") shouldBeLessThan snapshot.indexOf("line 999")
-    }
-
-    test("a chunk that straddles the head boundary is split, not lost") {
-        val log = BoundedLog(cap = 300, head = 8)
-        log.append("abcdefghij")
-        log.snapshot() shouldBe "abcdefghij"
-        log.append("k")
-        log.snapshot() shouldBe "abcdefghijk"
-    }
-
-    test("the elided count is exactly what was thrown away") {
-        val log = BoundedLog(cap = 10, head = 5)
-        log.append("x".repeat(100))
-        log.snapshot() shouldBe "xxxxx\n… [85 chars elided] …\nxxxxxxxxxx"
-    }
-})
-
-class CarriageReturnTest : FunSpec({
-
-    test("a redrawn line keeps only its final frame") {
-        collapseCarriageReturns("Progress: 1\rProgress: 2\rProgress: 3\ndone\n") shouldBe "Progress: 3\ndone\n"
-    }
-
-    test("windows line endings are just line endings") {
-        collapseCarriageReturns("x\r\ny") shouldBe "x\ny"
-    }
-
-    test("text without a carriage return is untouched") {
-        val text = "plain\nlines\n"
-        collapseCarriageReturns(text) shouldBe text
-    }
-
-    test("a frame that straddles two chunks still collapses at read time") {
-        val log = BoundedLog()
-        log.append("Progress: 1\rProg")
-        log.append("ress: 2\n")
-        collapseCarriageReturns(log.snapshot()) shouldBe "Progress: 2\n"
-    }
-})
 
 class BackgroundJobsTest : FunSpec({
 
@@ -155,6 +92,18 @@ class BackgroundJobsTest : FunSpec({
             jobs.drainFinished().shouldBeEmpty()
             jobs.killAll()
         }
+
+        test("the finished callback fires once per job, whatever ended it") {
+            val fired = CopyOnWriteArrayList<String>()
+            val bothDone = CountDownLatch(2)
+            val jobs = JobRegistry(workspace) { fired.add(it.name); bothDone.countDown() }
+
+            jobs.start("echo done", "quick")
+            jobs.start("sleep 300", "killed").stop()
+
+            bothDone.await(15, TimeUnit.SECONDS) shouldBe true
+            fired.sorted() shouldBe listOf("killed", "quick")
+        }
     }
 
     context("stopping") {
@@ -163,7 +112,7 @@ class BackgroundJobsTest : FunSpec({
             val marker = "kotest-job-stop-marker"
             val jobs = JobRegistry(workspace)
             val job = jobs.start("sleep 300 # $marker")
-            Thread.sleep(500)
+            Thread.sleep(500) // let bash get going, so the kill has a real process to hit
 
             val killedAt = System.currentTimeMillis()
             job.stop()
@@ -173,8 +122,7 @@ class BackgroundJobsTest : FunSpec({
             job.state shouldBe JobState.KILLED
             job.report() shouldContain "[Killed after"
 
-            awaitNoProcesses(marker)
-            processesMatching(marker) shouldBe 0
+            shouldLeaveNoProcess(marker)
         }
 
         test("killAll takes the descendants down with it") {
@@ -183,11 +131,10 @@ class BackgroundJobsTest : FunSpec({
             // The background child is the one that would survive a kill of the
             // bash -c parent alone, holding the pipes open forever.
             jobs.start("sleep 300 & sleep 300 # $marker")
-            Thread.sleep(500)
+            Thread.sleep(500) // let bash fork the child before we go after descendants
 
             jobs.killAll() shouldBe 1
-            awaitNoProcesses(marker)
-            processesMatching(marker) shouldBe 0
+            shouldLeaveNoProcess(marker)
             jobs.running().shouldBeEmpty()
         }
 

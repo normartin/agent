@@ -1,4 +1,5 @@
 import com.sun.net.httpserver.HttpServer
+import kotlinx.serialization.json.*
 import java.net.InetSocketAddress
 import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.CopyOnWriteArrayList
@@ -11,7 +12,11 @@ data class Reply(
 )
 
 /** What the server saw, so tests can assert on the request the harness built. */
-data class Recorded(val body: String, val authorization: String?)
+data class Recorded(val body: String, val authorization: String?) {
+    val json: JsonObject by lazy { Json.parseToJsonElement(body).jsonObject }
+    /** The conversation the harness sent: item 0 is the system prompt, the last item is the newest. */
+    val input: List<JsonObject> get() = json["input"]!!.jsonArray.map { it.jsonObject }
+}
 
 /**
  * An in-process stand-in for the OpenAI responses endpoint, built on the JDK's
@@ -23,7 +28,8 @@ class MockOpenAi : AutoCloseable {
     private val scripted = ConcurrentLinkedQueue<Reply>()
 
     val requests = CopyOnWriteArrayList<Recorded>()
-    var fallback = Reply(200, toolCallBody())
+    // A 400, so a test that scripts too few replies fails at once instead of looping to MAX_ITERATIONS.
+    var fallback = Reply(400, """{"error":{"message":"unscripted request"}}""")
 
     val baseUrl: String get() = "http://127.0.0.1:${server.address.port}"
 
@@ -56,86 +62,63 @@ fun rateLimited(resetSeconds: String = "0.05") = Reply(
     headers = mapOf("retry-after" to resetSeconds)
 )
 
-/**
- * A turn that calls the bash tool. The leading reasoning item is what a real
- * gpt-5 turn looks like and is the thing the harness has to echo back intact,
- * so it belongs in the default fixture rather than in one special-case test.
- */
-fun toolCallBody(
-    command: String = "ls -la",
-    cachedTokens: Long = 0,
+// ---- Output items, so a scripted conversation reads top to bottom: turn(reasoning(), bash(command = "ls")) ----
+
+/** A reasoning item, empty-summaried as real gpt-5 turns mostly are; the harness must echo it back intact. */
+fun reasoning(vararg summary: String) = buildJsonObject {
+    put("type", "reasoning")
+    put("id", "rs_1")
+    putJsonArray("summary") { summary.forEach { addJsonObject { put("type", "summary_text"); put("text", it) } } }
+}
+
+/** The model's final answer. */
+fun answer(text: String) = buildJsonObject {
+    put("type", "message")
+    put("id", "msg_1")
+    put("role", "assistant")
+    put("status", "completed")
+    putJsonArray("content") { addJsonObject { put("type", "output_text"); put("text", text) } }
+}
+
+/** A bash tool call as strict mode sends it: every field present, null when unset. */
+fun bash(
+    action: String? = null,
+    command: String? = null,
+    name: String? = null,
+    seconds: Number? = null,
+    callId: String = "call_1"
+) = bashRaw(
+    buildJsonObject {
+        put("action", action); put("command", command); put("name", name); put("seconds", seconds)
+    }.toString(),
+    callId
+)
+
+/** A bash tool call with [arguments] verbatim, for shapes strict mode would not produce. */
+fun bashRaw(arguments: String, callId: String = "call_1") = buildJsonObject {
+    put("type", "function_call")
+    put("id", "fc_$callId")
+    put("call_id", callId)
+    put("name", "bash")
+    put("arguments", arguments)
+}
+
+/** A 200 whose output is [items], with a usage block. */
+fun turn(
+    vararg items: JsonObject,
+    input: Long = 1000,
+    cached: Long = 0,
+    output: Long = 200,
     reasoningTokens: Long = 0
-) = """
-{
-  "output": [
-    { "type": "reasoning", "id": "rs_abc123", "summary": [] },
-    {
-      "type": "function_call",
-      "id": "fc_abc123",
-      "call_id": "call_abc123",
-      "name": "bash",
-      "arguments": "{\"command\":\"$command\"}"
-    }
-  ],
-  "usage": {
-    "input_tokens": 1000,
-    "output_tokens": 200,
-    "input_tokens_details": { "cached_tokens": $cachedTokens },
-    "output_tokens_details": { "reasoning_tokens": $reasoningTokens }
-  }
-}
-"""
-
-fun finalAnswerBody(text: String) = """
-{
-  "output": [
-    {
-      "type": "message",
-      "id": "msg_abc123",
-      "role": "assistant",
-      "status": "completed",
-      "content": [{ "type": "output_text", "text": "$text" }]
-    }
-  ],
-  "usage": { "input_tokens": 50, "output_tokens": 10 }
-}
-"""
-
-/**
- * A turn that calls the bash tool with an explicit action — the job verbs, and
- * "run" when a test wants to spell it out. [arguments] is the JSON the model
- * would send, escaped here the way the API carries it: as a string inside the
- * item. [toolCallBody] covers the other shape, a bare command with no action.
- */
-fun actionCallBody(arguments: String, callId: String = "call_jobs1") = """
-{
-  "output": [
-    { "type": "reasoning", "id": "rs_jobs", "summary": [] },
-    {
-      "type": "function_call",
-      "id": "fc_jobs",
-      "call_id": "$callId",
-      "name": "bash",
-      "arguments": "${arguments.replace("\"", "\\\"")}"
-    }
-  ],
-  "usage": { "input_tokens": 10, "output_tokens": 5 }
-}
-"""
-
-/** A tool-calling turn whose reasoning item carries summary text, as it does once summaries are requested. */
-fun reasoningSummaryBody(vararg summaries: String) = """
-{
-  "output": [
-    { "type": "reasoning", "id": "rs_sum", "summary": [${summaries.joinToString(",") { "{\"type\":\"summary_text\",\"text\":\"$it\"}" }}] },
-    {
-      "type": "function_call",
-      "id": "fc_sum",
-      "call_id": "call_sum",
-      "name": "bash",
-      "arguments": "{\"action\":\"run\",\"command\":\"echo hi\",\"name\":null,\"seconds\":null}"
-    }
-  ],
-  "usage": { "input_tokens": 10, "output_tokens": 5 }
-}
-"""
+) = Reply(
+    200,
+    buildJsonObject {
+        putJsonArray("output") { items.forEach { add(it) } }
+        putJsonObject("usage") {
+            put("input_tokens", input)
+            put("output_tokens", output)
+            putJsonObject("input_tokens_details") { put("cached_tokens", cached) }
+            putJsonObject("output_tokens_details") { put("reasoning_tokens", reasoningTokens) }
+        }
+    }.toString()
+)

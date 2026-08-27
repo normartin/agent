@@ -62,12 +62,14 @@ class ProjectInstructionsTest : FunSpec({
         val dir = tempdir()
         File(dir, "CLAUDE.md").writeText("Prefer fish shell syntax.")
         MockOpenAi().use { mock ->
-            mock.script(Reply(200, finalAnswerBody("ok")))
+            mock.script(turn(answer("ok")))
             BashAgentHarness(dir, "test-key", mock.baseUrl, depth = 0, subAgentCommand = null).runTask("hi")
-            val body = mock.requests.single().body
-            body shouldContain "Prefer fish shell syntax."
-            // Item 0, not a later message: the substring must precede the user turn.
-            body.indexOf("Prefer fish shell syntax.") shouldBeLessThan body.indexOf("\"hi\"")
+
+            // In the system prompt, not in a later message.
+            val input = mock.requests.single().input
+            input[0].str("role") shouldBe "system"
+            input[0].str("content")!! shouldContain "Prefer fish shell syntax."
+            input[1].str("content") shouldBe "hi"
         }
     }
 })

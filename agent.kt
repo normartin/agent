@@ -226,7 +226,7 @@ class BashAgentHarness(
     subAgentCommand: String? = selfCommand(),
     private val log: JsonlLog? = null,                // main wires AGENT_LOG; tests stay silent by default
     onJobFinished: (BackgroundJob) -> Unit = {}       // last, so callers can pass it as a trailing lambda
-) {
+) : AutoCloseable {
     private val jobs = JobRegistry(workspace, depth, log, onJobFinished)
     private val input = mutableListOf<JsonObject>()
     private val httpClient = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10)).build()
@@ -266,6 +266,8 @@ class BashAgentHarness(
         val killed = jobs.killAll()
         if (killed > 0) println("🛑 Killed $killed background job(s).")
     }
+
+    override fun close() = shutdown() // so a test's `use { }` cannot leak a job
 
     /** The model's final answer, or null when the task did not finish (API error, interrupt, iteration cap). */
     fun runTask(taskDescription: String): String? {
@@ -942,7 +944,7 @@ fun callOpenAI(
         if (status != 429 && status < 500) throw Exception("API Error [Status $status]: ${response.body()}")
         if (attempt >= MAX_RETRIES) throw Exception("API Error [Status $status] after $MAX_RETRIES retries: ${response.body()}")
 
-        val waitMs = retryDelayMs(response, attempt++)
+        val waitMs = retryDelayMs(response.headers().firstValue("retry-after").orElse(null), attempt++)
         log?.event("retry") { put("status", status); put("wait_ms", waitMs); put("attempt", attempt) }
         Spinner.stop()
         println("⏳ %d from the API — retrying in %.1fs (attempt %d/%d)".format(Locale.ROOT, status, waitMs / 1000.0, attempt, MAX_RETRIES))
@@ -966,8 +968,8 @@ private fun HttpResponse<String>.toTurn(): Turn {
 }
 
 /** Retry-After seconds plus a pad (landing on the window boundary earns another 429), else exponential. */
-fun retryDelayMs(response: HttpResponse<String>, attempt: Int): Long {
-    val hinted = response.headers().firstValue("retry-after").orElse(null)?.trim()?.toDoubleOrNull()
+fun retryDelayMs(retryAfter: String?, attempt: Int): Long {
+    val hinted = retryAfter?.trim()?.toDoubleOrNull()
     val delay = hinted?.let { (it * 1000).toLong() + 250 } ?: (1000L shl attempt)
     return delay.coerceIn(250, MAX_RETRY_WAIT_MS)
 }
