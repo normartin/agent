@@ -72,6 +72,7 @@ val PROMPT_CACHE_KEY = "agent-" + java.util.UUID.randomUUID()
 /** What the model is told at item 0 of every request. Stable by design: the prompt cache keys on it. */
 fun systemPrompt(workspace: File, depth: Int = AGENT_DEPTH, subAgentCommand: String? = selfCommand()): String = """
     You are a coding agent with a local bash shell via the "bash" tool. Working directory: ${workspace.absolutePath}
+    Commands already run there; no need to cd into it.
     You are in an ongoing console conversation; keep earlier turns in mind. When the request is done, answer and stop.
 
     Chain steps with && or a small script. A foreground command is killed after ${TIMEOUT_SECONDS}s and long output
@@ -626,20 +627,38 @@ fun truncate(text: String): String {
     return "$head\n… [${text.length - head.length - tail.length} chars elided] …\n$tail"
 }
 
-/** Keeps the last [cap] chars a job printed; a background job has no deadline to stop it filling memory. */
-class BoundedLog(private val cap: Int = MAX_JOB_LOG_CHARS) {
+/**
+ * Keeps the first [head] and the last [cap] chars a job printed; a background job has no deadline to
+ * stop it filling memory. A tail alone is not enough: a build's first error and its summary sit at
+ * opposite ends of the log, and the middle is downloads. [head] matches what [truncate] keeps, so the
+ * model's head really is the start of the output rather than the start of the last 40k chars.
+ */
+class BoundedLog(private val cap: Int = MAX_JOB_LOG_CHARS, private val head: Int = MAX_OUTPUT_CHARS * 2 / 3) {
+    private val first = StringBuilder()
     private val buf = StringBuilder()
     private var elided = 0L
 
     @Synchronized
     fun append(text: String) {
-        buf.append(text)
+        val room = head - first.length
+        if (room >= text.length) { first.append(text); return }
+        if (room > 0) { first.append(text, 0, room); buf.append(text, room, text.length) } else buf.append(text)
         val drop = buf.length - cap
         if (drop > 0) { buf.delete(0, drop); elided += drop }
     }
 
+    /** The marker sits between two real pieces of output, so [truncate] leaves both ends intact. */
     @Synchronized
-    fun snapshot() = if (elided == 0L) buf.toString() else "… [$elided chars elided] …\n$buf"
+    fun snapshot() = if (elided == 0L) "$first$buf" else "$first\n… [$elided chars elided] …\n$buf"
+}
+
+/**
+ * What a terminal would show: progress bars redraw a line with \r, and every frame kept verbatim
+ * is budget the model pays for and cannot use (a Maven download log is mostly such frames).
+ */
+fun collapseCarriageReturns(text: String): String {
+    if ('\r' !in text) return text
+    return text.replace("\r\n", "\n").split('\n').joinToString("\n") { it.substringAfterLast('\r') }
 }
 
 enum class JobState { RUNNING, EXITED, KILLED }
@@ -721,8 +740,9 @@ class BackgroundJob(
 
     /** The output so far. [note] replaces the status line. */
     fun report(note: String? = null) = buildString {
-        val stdout = out.snapshot()
-        val stderr = err.snapshot()
+        // Collapsed here, at read time, because a \r-delimited frame can straddle two drain chunks.
+        val stdout = collapseCarriageReturns(out.snapshot())
+        val stderr = collapseCarriageReturns(err.snapshot())
         if (stdout.isNotBlank()) append(stdout)
         if (stderr.isNotBlank()) append("ERROR OUTPUT:\n").append(stderr)
         append("\n")

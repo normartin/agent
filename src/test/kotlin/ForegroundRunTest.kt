@@ -4,6 +4,8 @@ import io.kotest.matchers.longs.shouldBeGreaterThanOrEqual
 import io.kotest.matchers.longs.shouldBeLessThan
 import io.kotest.matchers.shouldBe
 import io.kotest.matchers.string.shouldContain
+import io.kotest.matchers.string.shouldNotContain
+import io.kotest.matchers.string.shouldStartWith
 import kotlin.concurrent.thread
 
 /**
@@ -25,6 +27,22 @@ class ForegroundRunTest : FunSpec({
         report shouldContain "ERROR OUTPUT:"
         report shouldContain "boom"
         report shouldContain "[Exit Code: 3"
+    }
+
+    test("a flood of output reaches the model with its real start and its real end") {
+        // seq 1 20000 is ~110k chars: past the in-memory cap and far past the
+        // model's budget. What survives must be the first line and the last.
+        val report = truncate(JobRegistry(workspace).run("echo first; seq 1 20000; echo last", 30) { false }.report())
+        report.length.toLong() shouldBeLessThan MAX_OUTPUT_CHARS + 200L
+        report shouldStartWith "first\n1\n2\n"
+        report shouldContain "\n19999\n20000\nlast\n"
+        report shouldContain "[Exit Code: 0"
+        report shouldNotContain "\n10000\n"
+    }
+
+    test("progress-bar redraws are collapsed before the model sees them") {
+        val report = JobRegistry(workspace).run("printf 'Progress: 1\\rProgress: 2\\rProgress: 3\\ndone\\n'", 30) { false }.report()
+        report shouldStartWith "Progress: 3\ndone\n"
     }
 
     test("a foreground command runs in the workspace") {
