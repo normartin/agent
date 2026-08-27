@@ -2,3 +2,4 @@ agent_workspace/
 .gradle/
 build/
 .kotlin/
+agent.jsonl

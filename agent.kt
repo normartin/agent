@@ -164,7 +164,8 @@ class BashAgentHarness(
     private val timeoutSeconds: Long = TIMEOUT_SECONDS,
     depth: Int = AGENT_DEPTH,                         // tests pin it; real runs read the environment
     subAgentCommand: String? = selfCommand(),
-    onJobFinished: (BackgroundJob) -> Unit = {}       // rung from a job's watcher thread
+    private val log: JsonlLog? = null,                // main wires AGENT_LOG; tests stay silent by default
+    onJobFinished: (BackgroundJob) -> Unit = {}       // last, so callers can pass it as a trailing lambda
 ) {
     private val jobs = JobRegistry(workspace, depth, onJobFinished)
     private val input = mutableListOf<JsonObject>()
@@ -186,6 +187,12 @@ class BashAgentHarness(
         input.clear()
         input.add(message("system", systemPrompt))
         interrupted = false
+        log?.event("session") {
+            put("model", MODEL)
+            put("workspace", workspace.absolutePath)
+            put("prompt_cache_key", PROMPT_CACHE_KEY)
+            put("system_prompt", systemPrompt)
+        }
     }
 
     /** Cancels the running task, foreground command included. Background jobs live on. */
@@ -203,6 +210,7 @@ class BashAgentHarness(
     fun runTask(taskDescription: String): String? {
         pumpJobs(announceRunning = true) // before the user's message, so their words come last
         input.add(message("user", taskDescription))
+        log?.event("user") { put("text", taskDescription) }
         return runLoop()
     }
 
@@ -225,13 +233,20 @@ class BashAgentHarness(
             repeat(MAX_ITERATIONS) {
                 if (interrupted) { println("\n⏹️ Interrupted. Ask again to continue."); return null }
                 pumpJobs(announceRunning = false)
+                val (itemsBefore, charsBefore) = input.size to input.sumOf { it.toString().length }
                 trimHistory(input)
+                if (input.size < itemsBefore) log?.event("trim") {
+                    put("dropped", itemsBefore - input.size)
+                    put("chars_before", charsBefore)
+                    put("chars_after", input.sumOf { it.toString().length })
+                }
 
                 val turn = try {
                     Spinner.start("Thinking")
-                    callOpenAI(httpClient, input, apiKey, baseUrl) { interrupted }
+                    callOpenAI(httpClient, input, apiKey, baseUrl, { interrupted }, log)
                 } catch (e: Exception) {
                     Spinner.stop()
+                    log?.event("error") { put("message", e.message ?: e.toString()) }
                     if (interrupted) println("\n⏹️ Interrupted. Ask again to continue.")
                     else println("❌ API Error: ${e.message ?: e}")
                     return null
@@ -276,6 +291,11 @@ class BashAgentHarness(
         val id = call.str("call_id") ?: return null // "id" names the item; "call_id" is what a reply pairs with
         val rawArgs = call.str("arguments") ?: ""
         val args = runCatching { Json.parseToJsonElement(rawArgs).jsonObject }.getOrNull()
+        log?.event("tool_call") {
+            put("call_id", id)
+            put("name", call.str("name"))
+            put("arguments", rawArgs)
+        }
 
         val result = when {
             interrupted -> "[Skipped: interrupted by the user]"
@@ -284,6 +304,10 @@ class BashAgentHarness(
             else -> runBashCall(args, rawArgs)
         }
         println("📥 Output:\n$result\n")
+        log?.event("tool_result") {
+            put("call_id", id)
+            put("output", result)
+        }
 
         return buildJsonObject {
             put("type", "function_call_output")
@@ -364,6 +388,7 @@ class BashAgentHarness(
         jobs.drainFinished().forEach { job ->
             val notice = "[background job \"${job.name}\" finished] ${job.command}\n${truncate(job.report())}"
             println("🏁 $notice\n")
+            log?.event("job_notice") { put("text", notice) }
             input.add(message("user", notice))
         }
         if (!announceRunning) return
@@ -374,6 +399,7 @@ class BashAgentHarness(
             "- \"${it.name}\" (${it.elapsedSeconds}s): ${it.command}"
         }
         println("$listing\n")
+        log?.event("job_notice") { put("text", listing) }
         input.add(message("user", listing))
     }
 
@@ -445,16 +471,19 @@ fun main() {
         exitProcess(2)
     }
     val workspace = File(".").apply { mkdirs() }.canonicalFile
+    // Unset means the default file; set-but-empty means off. Sub-agents inherit the variable through
+    // the environment and append to the same file, telling their lines apart by pid and depth.
+    val log = (System.getenv("AGENT_LOG") ?: "agent.jsonl").takeIf { it.isNotBlank() }?.let { JsonlLog(File(it)) }
 
     // isTerminal(), not a null check: since JDK 22 System.console() exists even for a pipe.
-    if (System.console()?.isTerminal() == true) runConsole(workspace, apiKey) else runOneShot(workspace, apiKey)
+    if (System.console()?.isTerminal() == true) runConsole(workspace, apiKey, log) else runOneShot(workspace, apiKey, log)
 }
 
 /**
  * Non-interactive mode: all of stdin is the prompt, the answer is all that lands on stdout.
  * Exit code 0 = answered, 1 = did not finish, 2 = usage.
  */
-private fun runOneShot(workspace: File, apiKey: String) {
+private fun runOneShot(workspace: File, apiKey: String, log: JsonlLog?) {
     // The harness prints progress with println throughout. Swapping System.out for stderr turns all
     // of it into diagnostics without threading a logger through a single-file harness; the real
     // stdout is kept aside for the one thing a caller pipes us for.
@@ -467,7 +496,7 @@ private fun runOneShot(workspace: File, apiKey: String) {
         exitProcess(2)
     }
 
-    val harness = BashAgentHarness(workspace, apiKey)
+    val harness = BashAgentHarness(workspace, apiKey, log = log)
     Runtime.getRuntime().addShutdownHook(thread(start = false) { harness.shutdown() })
     Signal.handle(Signal("INT")) { harness.interrupt() }
 
@@ -479,9 +508,9 @@ private fun runOneShot(workspace: File, apiKey: String) {
     exitProcess(0) // explicit: a background job's watcher thread would otherwise keep the JVM alive
 }
 
-private fun runConsole(workspace: File, apiKey: String) {
+private fun runConsole(workspace: File, apiKey: String, log: JsonlLog?) {
     val events = LinkedBlockingQueue<Event>() // unbounded: put() runs on a job's watcher thread
-    val harness = BashAgentHarness(workspace, apiKey) { events.put(Event.JobFinished) }
+    val harness = BashAgentHarness(workspace, apiKey, log = log) { events.put(Event.JobFinished) }
 
     // JLine puts the tty in raw mode so arrow keys reach us as editing commands instead of
     // escape sequences. It must be closed on every exit path or the shell inherits a broken tty.
@@ -750,12 +779,35 @@ class JobRegistry(
 
 // ---------- 5. HTTP, retry and small utilities ----------
 
+/**
+ * One JSON object per line, appended and flushed immediately: a crash mid-turn must not lose the
+ * request that caused it. Synchronized because a job's watcher thread logs alongside the main loop.
+ */
+class JsonlLog(private val file: File) {
+    private val writer = java.io.FileWriter(file.absoluteFile.apply { parentFile?.mkdirs() }, Charsets.UTF_8, true).buffered()
+
+    @Synchronized
+    fun event(type: String, build: JsonObjectBuilder.() -> Unit) {
+        val line = buildJsonObject {
+            put("ts", java.time.Instant.now().toString())
+            put("pid", ProcessHandle.current().pid())
+            put("depth", AGENT_DEPTH)
+            put("type", type)
+            build()
+        }
+        writer.write(line.toString())
+        writer.newLine()
+        writer.flush()
+    }
+}
+
 fun callOpenAI(
     client: HttpClient,
     input: List<JsonObject>,
     apiKey: String,
     baseUrl: String = API_BASE,
-    cancelled: () -> Boolean = { false }
+    cancelled: () -> Boolean = { false },
+    log: JsonlLog? = null
 ): Turn {
     // No temperature: gpt-5.x is a reasoning model. "store" stays at its default of true so the bare
     // reasoning ids we echo back stay resolvable; store=false needs include=["reasoning.encrypted_content"].
@@ -766,26 +818,37 @@ fun callOpenAI(
         put("prompt_cache_key", PROMPT_CACHE_KEY)
         // The default cache lives 5-10 minutes; a user reading at the prompt easily outlasts that.
         put("prompt_cache_retention", "24h")
-    }.toString()
+    }
+    val url = "$baseUrl/v1/responses"
 
     val request = HttpRequest.newBuilder()
-        .uri(URI.create("$baseUrl/v1/responses"))
+        .uri(URI.create(url))
         .timeout(Duration.ofSeconds(API_TIMEOUT_SECONDS))
         .header("Authorization", "Bearer $apiKey")
         .header("Content-Type", "application/json")
-        .POST(HttpRequest.BodyPublishers.ofString(payload))
+        .POST(HttpRequest.BodyPublishers.ofString(payload.toString()))
         .build()
 
     // Rate limits are normal weather for a loop that resends its history: wait them out.
     var attempt = 0
     while (true) {
+        // The body goes in as JSON, not as a string, so jq can dig into it; only the header carries the key.
+        log?.event("request") { put("attempt", attempt); put("url", url); put("body", payload) }
+        val started = System.nanoTime()
         val response = client.send(request, HttpResponse.BodyHandlers.ofString())
         val status = response.statusCode()
+        log?.event("response") {
+            put("attempt", attempt)
+            put("status", status)
+            put("elapsed_ms", (System.nanoTime() - started) / 1_000_000)
+            put("body", runCatching { Json.parseToJsonElement(response.body()) }.getOrElse { JsonPrimitive(response.body()) })
+        }
         if (status == 200) return response.toTurn()
         if (status != 429 && status < 500) throw Exception("API Error [Status $status]: ${response.body()}")
         if (attempt >= MAX_RETRIES) throw Exception("API Error [Status $status] after $MAX_RETRIES retries: ${response.body()}")
 
         val waitMs = retryDelayMs(response, attempt++)
+        log?.event("retry") { put("status", status); put("wait_ms", waitMs); put("attempt", attempt) }
         Spinner.stop()
         println("⏳ %d from the API — retrying in %.1fs (attempt %d/%d)".format(Locale.ROOT, status, waitMs / 1000.0, attempt, MAX_RETRIES))
         Spinner.start("Waiting")
