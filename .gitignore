@@ -2,5 +2,5 @@ agent_workspace/
 .gradle/
 build/
 .kotlin/
-agent.jsonl
+agent*.jsonl
 !CLAUDE.md

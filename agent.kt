@@ -19,6 +19,9 @@ import java.net.http.HttpClient
 import java.net.http.HttpRequest
 import java.net.http.HttpResponse
 import java.time.Duration
+import java.time.Instant
+import java.time.ZoneOffset
+import java.time.format.DateTimeFormatter.ofPattern
 import java.util.Locale
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.Semaphore
@@ -220,7 +223,7 @@ class BashAgentHarness(
     private val log: JsonlLog? = null,                // main wires AGENT_LOG; tests stay silent by default
     onJobFinished: (BackgroundJob) -> Unit = {}       // last, so callers can pass it as a trailing lambda
 ) {
-    private val jobs = JobRegistry(workspace, depth, onJobFinished)
+    private val jobs = JobRegistry(workspace, depth, log, onJobFinished)
     private val input = mutableListOf<JsonObject>()
     private val httpClient = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10)).build()
 
@@ -526,12 +529,17 @@ fun main() {
         exitProcess(2)
     }
     val workspace = File(".").apply { mkdirs() }.canonicalFile
-    // Unset means the default file; set-but-empty means off. Sub-agents inherit the variable through
-    // the environment and append to the same file, telling their lines apart by pid and depth.
-    val log = (System.getenv("AGENT_LOG") ?: "agent.jsonl").takeIf { it.isNotBlank() }?.let { JsonlLog(File(it)) }
+    val log = resolveLogPath(System.getenv("AGENT_LOG"))?.let { JsonlLog(File(it)) }
 
     // isTerminal(), not a null check: since JDK 22 System.console() exists even for a pipe.
     if (System.console()?.isTerminal() == true) runConsole(workspace, apiKey, log) else runOneShot(workspace, apiKey, log)
+}
+
+/** AGENT_LOG: unset -> one file per session, blank -> off, otherwise the given path. */
+fun resolveLogPath(env: String?, now: Instant = Instant.now()): String? = when {
+    env == null -> "agent-${ofPattern("yyyyMMdd-HHmmss").withZone(ZoneOffset.UTC).format(now)}Z.jsonl"
+    env.isBlank() -> null
+    else -> env
 }
 
 /**
@@ -800,6 +808,7 @@ class BackgroundJob(
 class JobRegistry(
     private val workspace: File,
     private val depth: Int = AGENT_DEPTH,
+    private val log: JsonlLog? = null,                    // children append to the same file, see AGENT_LOG
     private val onFinished: (BackgroundJob) -> Unit = {} // last, so callers can pass a trailing lambda
 ) {
     private val jobs = LinkedHashMap<String, BackgroundJob>()
@@ -809,7 +818,10 @@ class JobRegistry(
     private fun launch(command: String) = ProcessBuilder("bash", "-c", command)
         .directory(workspace)
         .redirectInput(ProcessBuilder.Redirect.from(File("/dev/null"))) // no stdin: never block on input
-        .apply { environment()["AGENT_DEPTH"] = (depth + 1).toString() } // see MAX_AGENT_DEPTH
+        .apply {
+            environment()["AGENT_DEPTH"] = (depth + 1).toString() // see MAX_AGENT_DEPTH
+            environment()["AGENT_LOG"] = log?.path ?: "" // absolute, so a child that cd's still finds it; "" = off
+        }
         .start()
 
     /** Starts [command] detached. Throws only if it will not launch. */
@@ -863,8 +875,9 @@ class JobRegistry(
  * One JSON object per line, appended and flushed immediately: a crash mid-turn must not lose the
  * request that caused it. Synchronized because a job's watcher thread logs alongside the main loop.
  */
-class JsonlLog(private val file: File) {
-    private val writer = java.io.FileWriter(file.absoluteFile.apply { parentFile?.mkdirs() }, Charsets.UTF_8, true).buffered()
+class JsonlLog(file: File) {
+    val path: String = file.absolutePath
+    private val writer = java.io.FileWriter(File(path).apply { parentFile?.mkdirs() }, Charsets.UTF_8, true).buffered()
 
     @Synchronized
     fun event(type: String, build: JsonObjectBuilder.() -> Unit) {

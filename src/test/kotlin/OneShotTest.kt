@@ -56,6 +56,18 @@ class SubAgentDepthTest : FunSpec({
         }
     }
 
+    test("a background job inherits the parent's log file") {
+        MockOpenAi().use { mock ->
+            mock.script(
+                Reply(200, toolCallBody(command = "echo log=\$AGENT_LOG")),
+                Reply(200, finalAnswerBody("ok"))
+            )
+            val log = JsonlLog(java.io.File(workspace, "session.jsonl"))
+            BashAgentHarness(workspace, "test-key", mock.baseUrl, log = log).runTask("what log?")
+            mock.requests[1].body shouldContain "log=${log.path}"
+        }
+    }
+
     test("no launch command means no sub-agent offer") {
         MockOpenAi().use { mock ->
             mock.script(Reply(200, finalAnswerBody("ok")))

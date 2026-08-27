@@ -4,6 +4,7 @@ import io.kotest.matchers.collections.shouldContain
 import io.kotest.matchers.shouldBe
 import kotlinx.serialization.json.*
 import java.io.File
+import java.time.Instant
 
 /** The logfile is the only window into what the harness actually sends, so its shape is a contract. */
 class JsonlLogTest : FunSpec({
@@ -44,5 +45,15 @@ class JsonlLogTest : FunSpec({
                 "session", "user", "request", "response", "retry", "request", "response"
             )
         }
+    }
+
+    test("resolveLogPath uses a session timestamp when AGENT_LOG is unset") {
+        resolveLogPath(null, Instant.parse("2026-01-02T03:04:05Z")) shouldBe "agent-20260102-030405Z.jsonl"
+    }
+
+    test("resolveLogPath keeps explicit values and treats blank as off") {
+        resolveLogPath("custom/path.jsonl", Instant.EPOCH) shouldBe "custom/path.jsonl"
+        resolveLogPath("", Instant.EPOCH) shouldBe null
+        resolveLogPath("   ", Instant.EPOCH) shouldBe null
     }
 })
