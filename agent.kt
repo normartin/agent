@@ -647,7 +647,7 @@ fun instructionsNotice(workspace: File): String? =
 fun tailForConsole(text: String, keep: Int = SHOWN_OUTPUT_LINES): String {
     val lines = text.lines()
     val shown = if (lines.size <= keep) lines else listOf("[${lines.size - keep} lines hidden]") + lines.takeLast(keep)
-    return shown.joinToString("\n") { "    $it" }
+    return shown.joinToString("\n") { "   $it" }
 }
 
 /** Caps output, keeping head and tail: build failures land at the end. */
