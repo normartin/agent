@@ -375,7 +375,7 @@ class BashAgentHarness(
 
         return when (action) {
             "run" -> {
-                println("💻  Executing Bash: $command")
+                println("💻  Bash: $command")
                 runCatching { jobs.run(command!!, timeoutSeconds) { interrupted } }.fold(
                     onSuccess = { job ->
                         val note = when {
@@ -767,7 +767,6 @@ class BackgroundJob(
         // At read time: a \r frame can straddle two writes.
         val output = collapseCarriageReturns(readTruncated(logFile))
         if (output.isNotBlank()) append(output)
-        append("\n")
         append(
             note ?: when (state) {
                 JobState.RUNNING -> "[Still running after ${elapsedSeconds}s]"

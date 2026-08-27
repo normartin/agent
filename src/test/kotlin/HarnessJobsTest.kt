@@ -79,7 +79,7 @@ class HarnessJobsTest : FunSpec({
 
             val delivered = mock.requests[2].input.last()
             delivered.str("role") shouldBe "user"
-            delivered.str("content")!! shouldStartWith "[background job \"probe\" finished] echo ingested\ningested\n\n[Exit Code: 0"
+            delivered.str("content")!! shouldStartWith "[background job \"probe\" finished] echo ingested\ningested\n[Exit Code: 0"
         }
     }
 
@@ -159,7 +159,7 @@ class HarnessJobsTest : FunSpec({
                 }
 
                 mock.requests.size shouldBe 3
-                mock.requests[2].input.last().str("content")!! shouldStartWith "[background job \"alarm\" finished] echo woke-you-up\nwoke-you-up\n\n[Exit Code: 0"
+                mock.requests[2].input.last().str("content")!! shouldStartWith "[background job \"alarm\" finished] echo woke-you-up\nwoke-you-up\n[Exit Code: 0"
             }
         }
 
