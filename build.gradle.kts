@@ -17,7 +17,7 @@ repositories {
 sourceSets {
     main {
         kotlin.setSrcDirs(listOf(projectDir))
-        kotlin.filter.setIncludes(listOf("agent.kt"))
+        kotlin.filter.setIncludes(listOf("agent.kt", "agent-log.kt"))
     }
 }
 
@@ -26,7 +26,7 @@ sourceSets {
 // directory, so it would try to compile the Gradle build scripts themselves.
 // Pin the task's source to the single file instead.
 tasks.named<KotlinCompile>("compileKotlin") {
-    setSource(files("agent.kt"))
+    setSource(files("agent.kt", "agent-log.kt"))
 }
 
 application {
