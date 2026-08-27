@@ -70,3 +70,42 @@ shell through OpenAI Responses API (`/v1/responses`) tool calls.
   `AGENT_LOG` and append to the same file; `pid` and `depth` tell their lines apart.
 - Comments explain *why* a choice was made. Keep that style. Keep them very short. Usually 1 or 2 lines.
 
+## Agent Execution Policy (Default)
+
+Goal: deliver the smallest correct change that fully resolves the request.
+
+1) Workflow
+- Inspect first (briefly): check relevant files and local context before editing.
+- Then execute directly; do not ask for confirmation unless blocked or action is high-risk.
+- Prefer minimal diffs unless the user asks for broader refactor.
+
+2) Autonomy vs Questions
+- Ask before: public API changes, irreversible/destructive actions, adding/removing major dependencies, or unclear product behavior.
+- Otherwise make reasonable assumptions, state them briefly, and proceed.
+
+3) Safety / Scope
+- Stay within requested scope; avoid opportunistic rewrites.
+- Do not fix unrelated issues unless they block completion (mention blockers explicitly).
+- Never run destructive commands (e.g., `rm -rf`, history rewrites) unless explicitly requested.
+
+4) Validation
+- Validate at the smallest level that proves correctness:
+  - single file change: targeted test/lint/typecheck if available;
+  - cross-cutting change: broader test run.
+- If validation is skipped, say why (e.g., missing tool, time, or not applicable).
+
+5) Performance with Tools
+- Batch related shell steps with `&&` or small scripts.
+- Use background jobs for long-running tasks; wait only when results are needed.
+- Prefer disjoint-file parallelism only when safe.
+
+6) Final Response Contract
+   Provide:
+- What changed (concise)
+- Why it changed
+- Validation performed (and result)
+- Assumptions / risks / follow-ups (if any)
+
+7) Style
+- Be concise, concrete, and implementation-first.
+- Include only necessary explanation; prioritize actionable results.
