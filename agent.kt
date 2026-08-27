@@ -50,10 +50,18 @@ val AGENT_DEPTH = System.getenv("AGENT_DEPTH")?.toIntOrNull() ?: 0
 // resent every iteration and cached tokens still count against TPM.
 const val MAX_OUTPUT_CHARS = 6000
 const val MAX_HISTORY_CHARS = 120_000
+// Trimming rewrites the prefix right after item 0 and forfeits the prompt cache on everything behind
+// it, so cut deep and rarely: down to this, not merely under MAX_HISTORY_CHARS, or every turn past the
+// budget would drop one more item and miss the cache again.
+const val TRIM_TARGET_CHARS = MAX_HISTORY_CHARS * 6 / 10
 
 val API_BASE = System.getenv("OPENAI_BASE_URL")?.trimEnd('/') ?: "https://api.openai.com"
 const val MAX_RETRIES = 5
 const val MAX_RETRY_WAIT_MS = 60_000L
+
+// One key per process: OpenAI routes a request to the cache node by this plus the prompt prefix, so
+// parallel sub-agents sharing a system prompt do not compete for the same node.
+val PROMPT_CACHE_KEY = "agent-" + java.util.UUID.randomUUID()
 
 // ---------- 1. What the model sees: system prompt and tool schema ----------
 
@@ -135,7 +143,10 @@ data class Turn(
     val cachedPromptTokens: Long,
     val completionTokens: Long,
     val reasoningTokens: Long
-)
+) {
+    /** The number to watch: mid-session it should sit high, and a sudden 0 means the prefix changed. */
+    val cacheHitPercent: Int get() = if (promptTokens == 0L) 0 else (cachedPromptTokens * 100 / promptTokens).toInt()
+}
 
 /** The assistant's prose, gathered from the "message" items' content parts. */
 fun assistantText(output: JsonArray): String? = output
@@ -232,8 +243,9 @@ class BashAgentHarness(
                 cachedPromptTokens += turn.cachedPromptTokens
                 completionTokens += turn.completionTokens
                 println(
-                    "📊 %,d in (%,d cached) / %,d out (%,d reasoning) · \$%.4f · session \$%.4f".format(
-                        Locale.ROOT, turn.promptTokens, turn.cachedPromptTokens, turn.completionTokens, turn.reasoningTokens,
+                    "📊 %,d in (%,d cached, %d%% hit) / %,d out (%,d reasoning) · \$%.4f · session \$%.4f".format(
+                        Locale.ROOT, turn.promptTokens, turn.cachedPromptTokens, turn.cacheHitPercent,
+                        turn.completionTokens, turn.reasoningTokens,
                         turnCost(turn.promptTokens, turn.cachedPromptTokens, turn.completionTokens), sessionCost()
                     )
                 )
@@ -373,14 +385,17 @@ class BashAgentHarness(
     fun sessionCost() = turnCost(promptTokens, cachedPromptTokens, completionTokens)
 }
 
-/** Drops the oldest turns past the budget. The system prompt and the newest item always survive. */
+/**
+ * Past the budget, drops the oldest turns down to TRIM_TARGET_CHARS. The system prompt and the
+ * newest item always survive.
+ */
 fun trimHistory(input: MutableList<JsonObject>) {
     var total = input.sumOf { it.toString().length }
     if (total <= MAX_HISTORY_CHARS) return
 
     val limit = input.size - 1
     var drop = 1
-    while (drop < limit && total > MAX_HISTORY_CHARS) total -= input[drop++].toString().length
+    while (drop < limit && total > TRIM_TARGET_CHARS) total -= input[drop++].toString().length
     // An orphaned function_call_output is a guaranteed 400.
     while (drop < limit && input[drop].str("type") == "function_call_output") drop++
 
@@ -748,6 +763,9 @@ fun callOpenAI(
         put("model", MODEL)
         put("input", JsonArray(input))
         put("tools", TOOLS)
+        put("prompt_cache_key", PROMPT_CACHE_KEY)
+        // The default cache lives 5-10 minutes; a user reading at the prompt easily outlasts that.
+        put("prompt_cache_retention", "24h")
     }.toString()
 
     val request = HttpRequest.newBuilder()

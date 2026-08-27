@@ -93,6 +93,17 @@ class ApiProtocolTest : FunSpec({
             }
         }
 
+        test("pins the prompt cache: one key per process, kept for a day") {
+            MockOpenAi().use { mock ->
+                mock.call()
+                mock.call()
+                val keys = mock.requests.map { it.json()["prompt_cache_key"]!!.jsonPrimitive.content }
+                keys.toSet().size shouldBe 1
+                keys.first() shouldBe PROMPT_CACHE_KEY
+                mock.requests.first().json()["prompt_cache_retention"]!!.jsonPrimitive.content shouldBe "24h"
+            }
+        }
+
         test("passes the history through as input, unchanged") {
             MockOpenAi().use { mock ->
                 mock.call()

@@ -109,6 +109,19 @@ class TrimHistoryTest : FunSpec({
         kinds(input) shouldContainExactly listOf("system", "user")
     }
 
+    test("a trim cuts down to the target, so the next few turns do not trim again") {
+        // Each trim forfeits the prompt cache on the whole history; trimming to just under the
+        // budget would repeat that on every turn past it.
+        val input = session(turns = 40, pad = MAX_HISTORY_CHARS / 20)
+        trimHistory(input)
+        size(input) shouldBeLessThanOrEqualTo TRIM_TARGET_CHARS
+
+        input.add(roleMsg("user", "z".repeat(MAX_HISTORY_CHARS / 20)))
+        val afterOneMoreTurn = input.toList()
+        trimHistory(input)
+        input shouldContainExactly afterOneMoreTurn
+    }
+
     test("trimming twice changes nothing the second time") {
         val input = session(turns = 40, pad = MAX_HISTORY_CHARS / 20)
         trimHistory(input)
