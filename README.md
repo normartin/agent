@@ -131,7 +131,7 @@ At a high level, it:
    - If history gets too large, it trims old turns and optionally inserts a model-written summary.
 
 5. **Handles UX + runtime modes**
-   - **Interactive console mode** (JLine): `/help`, `/reset`, `/exit`, Ctrl+C behavior, job-finished events.
+   - **Interactive console mode** (JLine): `/help`, `/plan`, `/reset`, `/exit`, Ctrl+C behavior, job-finished events.
    - **One-shot mode** (`echo "..." | ./agent.kt`): reads stdin prompt once, prints only final answer to stdout.
 
 6. **Includes infra pieces**

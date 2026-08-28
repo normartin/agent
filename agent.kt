@@ -134,6 +134,11 @@ val SUMMARY_PROMPT = """
     error messages and numbers. Plain text, no preamble.
 """.trimIndent()
 
+// Appended to the user's message, never item 0: the prompt cache keys on item 0.
+val PLAN_NOTE = "\n\n[plan mode] Read-only: explore with bash (cat, grep, git log …) but do not create, modify or " +
+    "delete files, and do not start background jobs. End with a concrete step-by-step plan (files, edits, " +
+    "validation) and stop; the user will approve it and ask you to execute it."
+
 // One tool, five actions, resent every turn. We mark all fields required, so optionals are nullable:
 // that gives the model a legal way to omit a field as null instead of inventing filler.
 val TOOLS = buildJsonArray {
@@ -249,10 +254,11 @@ class BashAgentHarness(
     }
 
     /** The model's final answer, or null when the task did not finish (API error, interrupt, iteration cap). */
-    fun runTask(taskDescription: String): String? {
+    fun runTask(taskDescription: String, plan: Boolean = false): String? {
         pumpJobs(announceRunning = true) // first, so the user's words come last
-        input.add(message("user", taskDescription))
-        log?.event("user") { put("text", taskDescription) }
+        val text = if (plan) taskDescription + PLAN_NOTE else taskDescription
+        input.add(message("user", text))
+        log?.event("user") { put("text", text) }
         return runLoop()
     }
 
@@ -498,6 +504,7 @@ fun printHelp() = println(
     """
     Commands:
       /help    Show this help
+      /plan    Toggle plan mode: the model explores read-only and answers with a plan
       /reset   Clear the conversation history
       /exit    Quit (or Ctrl+D)
     Ctrl+C cancels the running task; at the prompt it quits.
@@ -587,12 +594,13 @@ private fun runConsole(workspace: File, apiKey: String, log: JsonlLog?) {
 
     // readLine() paints the prompt, so it must not overlap a task's output: one permit per prompt wanted.
     val wantLine = Semaphore(0)
+    var plan = false // the reader thread reads it only after the main loop releases wantLine
     thread(isDaemon = true) {
         while (true) {
             wantLine.acquire()
             val event = try {
                 // The \ before each continuation newline is a marker, not content.
-                Event.Typed(reader.readLine("\n👤  You: ").replace("\\\n", "\n"))
+                Event.Typed(reader.readLine(if (plan) "\n📋  Plan: " else "\n👤  You: ").replace("\\\n", "\n"))
             } catch (_: EndOfFileException) {
                 Event.EndOfInput
             } catch (_: UserInterruptException) { // Ctrl+C caught by JLine before our handler
@@ -624,7 +632,8 @@ private fun runConsole(workspace: File, apiKey: String, log: JsonlLog?) {
                     "/exit", "/quit" -> break
                     "/help" -> printHelp()
                     "/reset" -> { harness.reset(); println("🧹  History cleared.") }
-                    else -> { println(); harness.runTask(line) }
+                    "/plan" -> { plan = !plan; println(if (plan) "📋  Plan mode on: read-only, answers with a plan. /plan again to leave." else "🔧  Plan mode off.") }
+                    else -> { println(); harness.runTask(line, plan) }
                 }
             }
         }
