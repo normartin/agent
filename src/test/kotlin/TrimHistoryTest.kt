@@ -140,6 +140,26 @@ class TrimHistoryTest : FunSpec({
         input shouldContainExactly once
     }
 
+    test("the summarizer sees exactly the dropped items and its text lands at index 1 as a user item") {
+        val input = session(turns = 40, pad = MAX_HISTORY_CHARS / 20)
+        var seen: List<JsonObject>? = null
+        trimHistory(input) { dropped -> seen = dropped; "the gist" }
+
+        seen!!.first() shouldBe roleMsg("user", "task 0")          // system prompt not offered up
+        seen!!.last().str("role") shouldBe "assistant"             // stops right before the surviving user turn
+        input[1] shouldBe roleMsg("user", "[summary of earlier conversation]\nthe gist")
+        input[2].str("role") shouldBe "user"
+        input.first().str("content") shouldBe "sys"
+    }
+
+    test("a summarizer returning null falls back to the plain trim") {
+        val plain = session(turns = 40, pad = MAX_HISTORY_CHARS / 20)
+        trimHistory(plain)
+        val input = session(turns = 40, pad = MAX_HISTORY_CHARS / 20)
+        trimHistory(input) { null }
+        input shouldContainExactly plain
+    }
+
     test("the invariants hold across arbitrary sessions and budget pressures") {
         checkAll(200, Arb.int(1..30), Arb.int(1..16_000)) { turns, pad ->
             val input = session(turns, pad)

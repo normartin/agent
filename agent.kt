@@ -62,6 +62,8 @@ const val MAX_HISTORY_CHARS = 120_000
 const val SHOWN_OUTPUT_LINES = 5
 // Trimming forfeits the prompt cache behind the cut, so cut deep and rarely.
 const val TRIM_TARGET_CHARS = MAX_HISTORY_CHARS * 6 / 10
+// Tool results dominate the dropped span, and the summary only needs their gist.
+const val SUMMARY_RESULT_CHARS = 2_000
 
 val API_BASE = System.getenv("OPENAI_BASE_URL")?.trimEnd('/') ?: "https://api.openai.com"
 const val MAX_RETRIES = 5
@@ -131,6 +133,12 @@ fun subAgentPrompt(depth: Int, command: String?): String {
         Run several in parallel only on disjoint files: they share this working directory.
     """.trimIndent()
 }
+
+val SUMMARY_PROMPT = """
+    Summarize the conversation below for a coding agent that will continue it. Headings: Goal; Progress (done /
+    in progress / blocked); Key decisions; Files read or modified; Next steps. Be concrete: keep paths, commands,
+    error messages and numbers. Plain text, no preamble.
+""".trimIndent()
 
 // One tool, five actions, resent every turn. Strict requires every property, so optionals are nullable:
 // that gives the model a legal way to omit a field instead of inventing filler.
@@ -283,11 +291,13 @@ class BashAgentHarness(
                 if (interrupted) { println("\n⏹️ Interrupted. Ask again to continue."); return null }
                 pumpJobs(announceRunning = false)
                 val (itemsBefore, charsBefore) = input.size to input.sumOf { it.toString().length }
-                trimHistory(input)
+                var summary: String? = null
+                trimHistory(input) { dropped -> summarize(dropped).also { summary = it } }
                 if (input.size < itemsBefore) log?.event("trim") {
                     put("dropped", itemsBefore - input.size)
                     put("chars_before", charsBefore)
                     put("chars_after", input.sumOf { it.toString().length })
+                    put("summary", summary)
                 }
 
                 val turn = try {
@@ -453,16 +463,40 @@ class BashAgentHarness(
         input.add(message("user", listing))
     }
 
-    private fun message(role: String, content: String) = buildJsonObject {
-        put("role", role)
-        put("content", content)
+    /** One tool-less call over the dropped span as plain text (so the model summarizes rather than continues it). Null on failure. */
+    private fun summarize(dropped: List<JsonObject>): String? {
+        val text = dropped.mapNotNull { item ->
+            when (item.str("type")) {
+                // Our messages carry a string; the model's carry output_text parts.
+                null -> "${item.str("role")}: ${item.str("content")}"
+                "message" -> "${item.str("role")}: ${assistantText(JsonArray(listOf(item)))}"
+                "function_call" -> "call: ${item.str("arguments")}"
+                "function_call_output" -> "result: ${item.str("output").orEmpty().take(SUMMARY_RESULT_CHARS)}"
+                else -> null
+            }
+        }.joinToString("\n\n")
+        val request = listOf(message("system", SUMMARY_PROMPT), message("user", text))
+        Spinner.start("Summarizing")
+        return runCatching { callOpenAI(httpClient, request, apiKey, baseUrl, { interrupted }, log, tools = null) }
+            .also { Spinner.stop() }
+            .onSuccess { promptTokens += it.promptTokens; cachedPromptTokens += it.cachedPromptTokens; completionTokens += it.completionTokens }
+            .onFailure { log?.event("error") { put("message", "summary: ${it.message ?: it}") } }
+            .getOrNull()?.let { assistantText(it.output) }
     }
 
     fun sessionCost() = turnCost(promptTokens, cachedPromptTokens, completionTokens)
 }
 
-/** Past the budget, drops the oldest turns down to TRIM_TARGET_CHARS. Item 0 and the newest item survive. */
-fun trimHistory(input: MutableList<JsonObject>) {
+fun message(role: String, content: String) = buildJsonObject {
+    put("role", role)
+    put("content", content)
+}
+
+/**
+ * Past the budget, drops the oldest turns down to TRIM_TARGET_CHARS. Item 0 and the newest item survive.
+ * [summarize] sees the dropped items; its text replaces them as one user item, so the cut still lands on a user turn.
+ */
+fun trimHistory(input: MutableList<JsonObject>, summarize: (List<JsonObject>) -> String? = { null }) {
     var total = input.sumOf { it.toString().length }
     if (total <= MAX_HISTORY_CHARS) return
 
@@ -474,8 +508,10 @@ fun trimHistory(input: MutableList<JsonObject>) {
     if (drop >= limit) drop = 1
 
     if (drop > 1) {
+        val summary = summarize(input.subList(1, drop).toList())
         input.subList(1, drop).clear()
-        println("🧹  Trimmed ${drop - 1} old item(s) to stay inside the context budget.")
+        if (summary != null) input.add(1, message("user", "[summary of earlier conversation]\n$summary"))
+        println("🧹  Trimmed ${drop - 1} old item(s) to stay inside the context budget" + (if (summary != null) ", summarized." else "."))
     }
 }
 
@@ -881,14 +917,15 @@ fun callOpenAI(
     apiKey: String,
     baseUrl: String = API_BASE,
     cancelled: () -> Boolean = { false },
-    log: JsonlLog? = null
+    log: JsonlLog? = null,
+    tools: JsonArray? = TOOLS // null for the summary call: it must answer, not act
 ): Turn {
     // "store" stays true so the echoed reasoning ids stay resolvable (store=false needs
     // include=["reasoning.encrypted_content"]). "summary" feeds the 🧠 line.
     val payload = buildJsonObject {
         put("model", MODEL)
         put("input", JsonArray(input))
-        put("tools", TOOLS)
+        if (tools != null) put("tools", tools)
         putJsonObject("reasoning") { put("effort", REASONING_EFFORT); put("summary", "auto") }
         put("prompt_cache_key", PROMPT_CACHE_KEY)
         // The default retention is minutes; a user idle at the prompt outlasts that.

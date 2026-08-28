@@ -49,6 +49,9 @@ The code should stay short and readable. If new features required signigificantl
   default of true, so the bare reasoning ids stay resolvable server-side.
   Setting `store` to false silently breaks it unless you also request
   `include: ["reasoning.encrypted_content"]`.
+- Past `MAX_HISTORY_CHARS` the oldest turns are dropped and replaced by a model-written summary
+  (`trimHistory` + `summarize`): one tool-less call over the dropped span, inserted as a *user* item at
+  index 1. Never item 0, so the cached prefix survives the trim; on failure the plain trim still happens.
 - The console loop is event-driven: stdin is read on its own thread and pushed
   onto a queue that a finished job also writes to. That is what lets a job
   finishing start a turn with the user idle at the prompt.

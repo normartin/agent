@@ -10,6 +10,7 @@ It has only one tool **bash**. No guardrails! Run it in a sandbox. OpenAI API on
 - Interactive and batch mode.
 - Sub-agents: calls itself recursively.
 - Supports `CLAUDE.md` / `AGENTS.md`.
+- History trimming.
 - Cost estimation.
 
 ## Run
@@ -80,7 +81,7 @@ echo "fix the tests" | ./agent.kt   # one-shot: answer on stdout
 - It supports both:
   - **interactive console mode** (JLine, `/help`, `/reset`, Ctrl+C handling), and
   - **one-shot stdin mode** (`echo "..." | ./agent.kt`).
-- It includes history trimming, token/cost tracking, and session lifecycle handling.
+- It includes history trimming (the dropped span is replaced by a model-written summary), token/cost tracking, and session lifecycle handling.
 - It has built-in HTTP retry logic (429/5xx), and optional JSONL logging (`AGENT_LOG`) of requests, responses, tool calls, retries, and job events.
 📊  35,526 in (22,016 cached, 61% hit) / 707 out (207 reasoning) · $0.0374 · session $0.0374
 Session cost: $0.0374
