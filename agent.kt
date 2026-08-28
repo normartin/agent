@@ -75,15 +75,9 @@ val PROMPT_CACHE_KEY = "agent-" + java.util.UUID.randomUUID()
 // ---------- 1. What the model sees: system prompt and tool schema ----------
 
 /** Item 0 of every request. Stable by design: the prompt cache keys on it. */
-fun systemPrompt(
-    workspace: File,
-    depth: Int = AGENT_DEPTH,
-    subAgentCommand: String? = selfCommand(),
-    instructions: String = projectInstructions(workspace),
-    tools: String = availableTools()
-): String = """
+fun systemPrompt(workspace: File, depth: Int = AGENT_DEPTH, subAgentCommand: String? = selfCommand()): String = """
     You are a coding agent with a local bash shell via the "bash" tool. Working directory: ${workspace.absolutePath}
-    Commands already run there; no need to cd into it. $tools There is no apply_patch: edit with sed, python3 or a heredoc.
+    Commands already run there; no need to cd into it. ${availableTools()} There is no apply_patch: edit with sed, python3 or a heredoc.
     You are in an ongoing console conversation; keep earlier turns in mind. When the request is done, answer and stop.
 
     Chain steps with && or a small script. A foreground command is killed after ${TIMEOUT_SECONDS}s and output over
@@ -104,7 +98,7 @@ fun systemPrompt(
     that proves correctness. Prefer grep/sed one-liners over writing a script. Web pages: never print raw HTML;
     docs sites usually serve markdown at the URL with .md appended (or list pages in /llms.txt), otherwise strip
     tags (sed 's/<[^>]*>//g') and grep -C for what you need.
-""".trimIndent() + subAgentPrompt(depth, subAgentCommand) + instructionsPrompt(instructions)
+""".trimIndent() + subAgentPrompt(depth, subAgentCommand) + instructionsPrompt(projectInstructions(workspace))
 
 /** Last, so the harness text ahead of it is identical in every project. */
 fun instructionsPrompt(instructions: String): String =
@@ -186,31 +180,24 @@ val TOOLS = buildJsonArray {
 // ---------- 2. Agent loop ----------
 
 /** One model turn: the raw output items and what they cost. */
-data class Turn(
-    val output: JsonArray,
-    val promptTokens: Long,
-    val cachedPromptTokens: Long,
-    val completionTokens: Long,
-    val reasoningTokens: Long
-)
+data class Turn(val output: JsonArray, val usage: Usage)
 
-/** The "reasoning" items' summary parts. */
-fun reasoningSummary(output: JsonArray): String? = output
+data class Usage(val input: Long = 0, val cached: Long = 0, val output: Long = 0, val reasoning: Long = 0) {
+    operator fun plus(o: Usage) = Usage(input + o.input, cached + o.cached, output + o.output, reasoning + o.reasoning)
+    val cost get() = turnCost(input, cached, output)
+}
+
+/** The "text" of every [parts] entry of the [type] items, or null when there is none. */
+fun itemTexts(output: List<JsonElement>, type: String, parts: String): String? = output
     .map { it.jsonObject }
-    .filter { it.str("type") == "reasoning" }
-    .flatMap { it["summary"]?.jsonArray.orEmpty() }
+    .filter { it.str("type") == type }
+    .flatMap { it[parts]?.jsonArray.orEmpty() }
     .mapNotNull { it.jsonObject.str("text") }
     .joinToString("\n")
     .takeUnless { it.isBlank() }
 
-/** The "message" items' text parts. */
-fun assistantText(output: JsonArray): String? = output
-    .map { it.jsonObject }
-    .filter { it.str("type") == "message" }
-    .flatMap { it["content"]?.jsonArray.orEmpty() }
-    .mapNotNull { it.jsonObject.str("text") }
-    .joinToString("\n")
-    .takeUnless { it.isBlank() }
+fun reasoningSummary(output: JsonArray) = itemTexts(output, "reasoning", "summary")
+fun assistantText(output: JsonArray) = itemTexts(output, "message", "content")
 
 class BashAgentHarness(
     private val workspace: File,
@@ -231,9 +218,7 @@ class BashAgentHarness(
     /** Tells Ctrl+C whether to cancel or quit. */
     @Volatile var busy = false; private set
 
-    private var promptTokens = 0L
-    private var cachedPromptTokens = 0L
-    private var completionTokens = 0L
+    private var session = Usage()
 
     private val systemPrompt = systemPrompt(workspace, depth, subAgentCommand)
 
@@ -258,12 +243,10 @@ class BashAgentHarness(
         jobs.interruptForeground()
     }
 
-    fun shutdown() {
+    override fun close() {
         val killed = jobs.killAll()
         if (killed > 0) println("🛑  Killed $killed background job(s).")
     }
-
-    override fun close() = shutdown()
 
     /** The model's final answer, or null when the task did not finish (API error, interrupt, iteration cap). */
     fun runTask(taskDescription: String): String? {
@@ -285,7 +268,7 @@ class BashAgentHarness(
     private fun runLoop(): String? {
         interrupted = false
         busy = true
-        var inTok = 0L; var cachedTok = 0L; var outTok = 0L; var reasonTok = 0L
+        var used = Usage()
         try {
             repeat(MAX_ITERATIONS) {
                 if (interrupted) { println("\n⏹️ Interrupted. Ask again to continue."); return null }
@@ -300,24 +283,17 @@ class BashAgentHarness(
                     put("summary", summary)
                 }
 
-                val turn = try {
-                    Spinner.start("Thinking")
-                    callOpenAI(httpClient, input, apiKey, baseUrl, { interrupted }, log)
-                } catch (e: Exception) {
-                    Spinner.stop()
-                    log?.event("error") { put("message", e.message ?: e.toString()) }
-                    if (interrupted) println("\n⏹️ Interrupted. Ask again to continue.")
-                    else println("❌  API Error: ${e.message ?: e}")
-                    return null
-                } finally {
-                    Spinner.stop()
-                }
-
-                promptTokens += turn.promptTokens
-                cachedPromptTokens += turn.cachedPromptTokens
-                completionTokens += turn.completionTokens
-                inTok += turn.promptTokens; cachedTok += turn.cachedPromptTokens
-                outTok += turn.completionTokens; reasonTok += turn.reasoningTokens
+                Spinner.start("Thinking")
+                val turn = runCatching { callOpenAI(httpClient, input, apiKey, baseUrl, { interrupted }, log) }
+                    .also { Spinner.stop() }
+                    .getOrElse { e ->
+                        log?.event("error") { put("message", e.message ?: e.toString()) }
+                        if (interrupted) println("\n⏹️ Interrupted. Ask again to continue.")
+                        else println("❌  API Error: ${e.message ?: e}")
+                        return null
+                    }
+                used += turn.usage
+                session += turn.usage
 
                 // Echoed back verbatim, reasoning included: that keeps the model's thinking alive.
                 turn.output.forEach { input.add(it.jsonObject) }
@@ -340,10 +316,10 @@ class BashAgentHarness(
         } finally {
             busy = false
             // Once per turn, not per call: the tool loop is the noisy part. A low hit % mid-session means the prefix changed.
-            if (inTok > 0) println(
+            if (used.input > 0) println(
                 "📊  %,d in (%,d cached, %d%% hit) / %,d out (%,d reasoning) · \$%.4f · session \$%.4f".format(
-                    Locale.ROOT, inTok, cachedTok, cachedTok * 100 / inTok, outTok, reasonTok,
-                    turnCost(inTok, cachedTok, outTok), sessionCost()
+                    Locale.ROOT, used.input, used.cached, used.cached * 100 / used.input, used.output, used.reasoning,
+                    used.cost, session.cost
                 )
             )
         }
@@ -387,29 +363,23 @@ class BashAgentHarness(
             return "Execution Error: '$action' needs a 'command' (got: $rawArgs)"
         }
 
-        return when (action) {
+        return runCatching { when (action) {
             "run" -> {
                 println("💻  Bash: $command")
-                runCatching { jobs.run(command!!, timeoutSeconds) { interrupted } }.fold(
-                    onSuccess = { job ->
-                        val note = when {
-                            job.state != JobState.KILLED -> null
-                            interrupted -> "[Interrupted by the user — process killed]"
-                            else -> "[TIMED OUT after ${timeoutSeconds}s — process killed. Output above is partial.]"
-                        }
-                        job.report(note)
-                    },
-                    onFailure = { "Execution Error: ${it.message}" }
-                )
+                val job = jobs.run(command!!, timeoutSeconds) { interrupted }
+                val note = when {
+                    job.state != JobState.KILLED -> null
+                    interrupted -> "[Interrupted by the user — process killed]"
+                    else -> "[TIMED OUT after ${timeoutSeconds}s — process killed. Output above is partial.]"
+                }
+                job.report(note)
             }
 
-            "start" -> runCatching { jobs.start(command!!, name) }.fold(
-                onSuccess = { job ->
-                    println("🚀  Started background job \"${job.name}\": $command")
-                    "Started background job \"${job.name}\". Its output will be delivered to you when it finishes."
-                },
-                onFailure = { "Execution Error: ${it.message}" }
-            )
+            "start" -> {
+                val job = jobs.start(command!!, name)
+                println("🚀  Started background job \"${job.name}\": $command")
+                "Started background job \"${job.name}\". Its output will be delivered to you when it finishes."
+            }
 
             "stop" -> withJob(name) { job ->
                 job.stop()
@@ -433,7 +403,7 @@ class BashAgentHarness(
             }
 
             else -> "Execution Error: unknown action '$action' — use run, start, stop, output or wait."
-        }
+        } }.getOrElse { "Execution Error: ${it.message}" }
     }
 
     private fun withJob(name: String?, block: (BackgroundJob) -> String): String {
@@ -445,22 +415,16 @@ class BashAgentHarness(
 
     /** Delivers finished jobs and, at a user turn, what still runs. As messages, never in item 0: the cache keys on it. */
     private fun pumpJobs(announceRunning: Boolean) {
-        jobs.drainFinished().forEach { job ->
-            val notice = "[background job \"${job.name}\" finished] ${job.command}\n${job.report()}"
-            println("🏁  $notice\n")
-            log?.event("job_notice") { put("text", notice) }
-            input.add(message("user", notice))
+        fun notice(text: String, icon: String = "") {
+            println("$icon$text\n")
+            log?.event("job_notice") { put("text", text) }
+            input.add(message("user", text))
         }
-        if (!announceRunning) return
-
-        val live = jobs.running()
-        if (live.isEmpty()) return
-        val listing = live.joinToString("\n", prefix = "[background jobs still running]\n") {
+        jobs.drainFinished().forEach { notice("[background job \"${it.name}\" finished] ${it.command}\n${it.report()}", "🏁  ") }
+        val live = if (announceRunning) jobs.running() else return
+        if (live.isNotEmpty()) notice(live.joinToString("\n", prefix = "[background jobs still running]\n") {
             "- \"${it.name}\" (${it.elapsedSeconds}s): ${it.command}"
-        }
-        println("$listing\n")
-        log?.event("job_notice") { put("text", listing) }
-        input.add(message("user", listing))
+        })
     }
 
     /** One tool-less call over the dropped span as plain text (so the model summarizes rather than continues it). Null on failure. */
@@ -469,7 +433,7 @@ class BashAgentHarness(
             when (item.str("type")) {
                 // Our messages carry a string; the model's carry output_text parts.
                 null -> "${item.str("role")}: ${item.str("content")}"
-                "message" -> "${item.str("role")}: ${assistantText(JsonArray(listOf(item)))}"
+                "message" -> "${item.str("role")}: ${itemTexts(listOf(item), "message", "content")}"
                 "function_call" -> "call: ${item.str("arguments")}"
                 "function_call_output" -> "result: ${item.str("output").orEmpty().take(SUMMARY_RESULT_CHARS)}"
                 else -> null
@@ -479,12 +443,12 @@ class BashAgentHarness(
         Spinner.start("Summarizing")
         return runCatching { callOpenAI(httpClient, request, apiKey, baseUrl, { interrupted }, log, tools = null) }
             .also { Spinner.stop() }
-            .onSuccess { promptTokens += it.promptTokens; cachedPromptTokens += it.cachedPromptTokens; completionTokens += it.completionTokens }
+            .onSuccess { session += it.usage }
             .onFailure { log?.event("error") { put("message", "summary: ${it.message ?: it}") } }
             .getOrNull()?.let { assistantText(it.output) }
     }
 
-    fun sessionCost() = turnCost(promptTokens, cachedPromptTokens, completionTokens)
+    fun sessionCost() = session.cost
 }
 
 fun message(role: String, content: String) = buildJsonObject {
@@ -580,7 +544,7 @@ private fun runOneShot(workspace: File, apiKey: String, log: JsonlLog?) {
     }
 
     val harness = BashAgentHarness(workspace, apiKey, log = log, echoAnswer = false)
-    Runtime.getRuntime().addShutdownHook(thread(start = false) { harness.shutdown() })
+    Runtime.getRuntime().addShutdownHook(thread(start = false) { harness.close() })
     Signal.handle(Signal("INT")) { harness.interrupt() }
     instructionsNotice(workspace)?.let { System.err.println(it) }
 
@@ -611,7 +575,7 @@ private fun runConsole(workspace: File, apiKey: String, log: JsonlLog?) {
     }
 
     // Covers every exit path.
-    Runtime.getRuntime().addShutdownHook(thread(start = false) { harness.shutdown() })
+    Runtime.getRuntime().addShutdownHook(thread(start = false) { harness.close() })
 
     Signal.handle(Signal("INT")) {
         if (harness.busy) harness.interrupt() else { farewell(); exitProcess(0) }
@@ -872,9 +836,7 @@ class JobRegistry(
         val cleaned = requested.orEmpty().replace(Regex("[^A-Za-z0-9_.-]"), "-").trim('-', '.').take(40)
         val base = cleaned.ifBlank { "job${++counter}" }
         if (base !in jobs) return base
-        var suffix = 2
-        while ("$base-$suffix" in jobs) suffix++
-        return "$base-$suffix"
+        return generateSequence(2) { it + 1 }.map { "$base-$it" }.first { it !in jobs }
     }
 
     @Synchronized fun find(name: String) = jobs[name]
@@ -899,7 +861,7 @@ class JsonlLog(file: File) {
     @Synchronized
     fun event(type: String, build: JsonObjectBuilder.() -> Unit) {
         val line = buildJsonObject {
-            put("ts", java.time.Instant.now().toString())
+            put("ts", Instant.now().toString())
             put("pid", ProcessHandle.current().pid())
             put("depth", AGENT_DEPTH)
             put("type", type)
@@ -973,13 +935,12 @@ private fun HttpResponse<String>.toTurn(): Turn {
     val output = json["output"]?.jsonArray
         ?: throw Exception("API response did not contain an 'output' array: ${body()}")
     val usage = json["usage"]?.jsonObject
-    return Turn(
-        output = output,
-        promptTokens = usage.long("input_tokens"),
-        cachedPromptTokens = usage.obj("input_tokens_details").long("cached_tokens"),
-        completionTokens = usage.long("output_tokens"),
-        reasoningTokens = usage.obj("output_tokens_details").long("reasoning_tokens")
-    )
+    return Turn(output, Usage(
+        input = usage.long("input_tokens"),
+        cached = usage.obj("input_tokens_details").long("cached_tokens"),
+        output = usage.long("output_tokens"),
+        reasoning = usage.obj("output_tokens_details").long("reasoning_tokens")
+    ))
 }
 
 /** Retry-After plus a pad (the window boundary earns another 429), else exponential. */

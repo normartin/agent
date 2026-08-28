@@ -209,10 +209,10 @@ class ApiProtocolTest : FunSpec({
             MockOpenAi().use { mock ->
                 mock.script(turn(answer("ok"), input = 1000, cached = 768, output = 200, reasoningTokens = 128))
                 val turn = mock.call()
-                turn.promptTokens shouldBe 1000L
-                turn.cachedPromptTokens shouldBe 768L
-                turn.completionTokens shouldBe 200L
-                turn.reasoningTokens shouldBe 128L
+                turn.usage.input shouldBe 1000L
+                turn.usage.cached shouldBe 768L
+                turn.usage.output shouldBe 200L
+                turn.usage.reasoning shouldBe 128L
             }
         }
 
@@ -220,8 +220,8 @@ class ApiProtocolTest : FunSpec({
             MockOpenAi().use { mock ->
                 mock.script(Reply(200, """{"output":[]}"""))
                 val turn = mock.call()
-                turn.promptTokens shouldBe 0L
-                turn.cachedPromptTokens shouldBe 0L
+                turn.usage.input shouldBe 0L
+                turn.usage.cached shouldBe 0L
             }
         }
 

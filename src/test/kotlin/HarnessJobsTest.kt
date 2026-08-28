@@ -209,7 +209,7 @@ class HarnessJobsTest : FunSpec({
             harness.runTask("start a long one")
 
             Thread.sleep(500) // let bash fork the background child before we go after descendants
-            harness.shutdown()
+            harness.close()
 
             shouldLeaveNoProcess(marker)
         }
