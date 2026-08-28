@@ -39,8 +39,8 @@ application {
 dependencies {
     // Keep in sync with the //DEPS lines in agent.kt — BuildConsistencyTest
     // fails if these drift apart.
-    implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.7.3")
-    implementation("org.jline:jline:3.30.16")
+    implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.11.0")
+    implementation("org.jline:jline:4.4.0")
 
     testImplementation("io.kotest:kotest-runner-junit5:6.2.4")
     testImplementation("io.kotest:kotest-assertions-core:6.2.4")

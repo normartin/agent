@@ -2,7 +2,7 @@
 //JAVA 21+
 //KOTLIN 2.4.10
 //DEPS org.jetbrains.kotlin:kotlin-stdlib:2.4.10
-//DEPS org.jetbrains.kotlinx:kotlinx-serialization-json:1.7.3
+//DEPS org.jetbrains.kotlinx:kotlinx-serialization-json:1.11.0
 
 // Renders agent.kt JSONL logs as a readable transcript: user turns, reasoning, commands, clipped output.
 

@@ -3,16 +3,20 @@
 //JAVA_OPTIONS --enable-native-access=ALL-UNNAMED
 //KOTLIN 2.4.10
 //DEPS org.jetbrains.kotlin:kotlin-stdlib:2.4.10
-//DEPS org.jetbrains.kotlinx:kotlinx-serialization-json:1.7.3
-//DEPS org.jline:jline:3.30.16
+//DEPS org.jetbrains.kotlinx:kotlinx-serialization-json:1.11.0
+//DEPS org.jline:jline:4.4.0
 
 import kotlinx.serialization.json.*
+import org.jline.keymap.KeyMap
 import org.jline.reader.EndOfFileException
 import org.jline.reader.LineReader
 import org.jline.reader.LineReaderBuilder
 import org.jline.reader.UserInterruptException
+import org.jline.reader.Widget
 import org.jline.reader.impl.DefaultParser
+import org.jline.reader.impl.LineReaderImpl
 import org.jline.terminal.TerminalBuilder
+import org.jline.utils.InfoCmp
 import sun.misc.Signal
 import java.io.File
 import java.net.URI
@@ -504,7 +508,7 @@ fun printHelp() = println(
     """
     Commands:
       /help    Show this help
-      /plan    Toggle plan mode: the model explores read-only and answers with a plan
+      /plan    Toggle plan mode (or Shift-Tab): the model explores read-only and answers with a plan
       /reset   Clear the conversation history
       /exit    Quit (or Ctrl+D)
     Ctrl+C cancels the running task; at the prompt it quits.
@@ -595,12 +599,20 @@ private fun runConsole(workspace: File, apiKey: String, log: JsonlLog?) {
     // readLine() paints the prompt, so it must not overlap a task's output: one permit per prompt wanted.
     val wantLine = Semaphore(0)
     var plan = false // the reader thread reads it only after the main loop releases wantLine
+    fun prompt() = if (plan) "\n📋  Plan: " else "\n👤  You: "
+    // Shift-Tab (backtab) flips plan mode mid-line; setPrompt is only on the impl; a diffed redisplay garbles the emoji, so redraw fully.
+    reader.keyMaps[LineReader.MAIN]!!.bind(Widget {
+        plan = !plan
+        (reader as LineReaderImpl).setPrompt(prompt())
+        reader.callWidget(LineReader.REDRAW_LINE); reader.callWidget(LineReader.REDISPLAY)
+        true
+    }, KeyMap.key(terminal, InfoCmp.Capability.key_btab), "\u001b[Z")
     thread(isDaemon = true) {
         while (true) {
             wantLine.acquire()
             val event = try {
                 // The \ before each continuation newline is a marker, not content.
-                Event.Typed(reader.readLine(if (plan) "\n📋  Plan: " else "\n👤  You: ").replace("\\\n", "\n"))
+                Event.Typed(reader.readLine(prompt()).replace("\\\n", "\n"))
             } catch (_: EndOfFileException) {
                 Event.EndOfInput
             } catch (_: UserInterruptException) { // Ctrl+C caught by JLine before our handler
@@ -620,9 +632,10 @@ private fun runConsole(workspace: File, apiKey: String, log: JsonlLog?) {
         when (val event = events.take()) {
             Event.EndOfInput -> break
             Event.JobFinished -> {
-                // The prompt is still held by readLine on the other thread; redraw is the only cross-thread call JLine allows.
-                if (harness.resume()) prompted = false
-                else runCatching { reader.callWidget(LineReader.REDRAW_LINE); reader.callWidget(LineReader.REDISPLAY) }
+                // readLine is still active on the reader thread (it cannot be cancelled), so a turn's output
+                // scrolls its prompt away; redraw is the only cross-thread call JLine allows.
+                harness.resume()
+                runCatching { reader.callWidget(LineReader.REDRAW_LINE); reader.callWidget(LineReader.REDISPLAY) }
             }
             is Event.Typed -> {
                 prompted = false
