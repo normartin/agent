@@ -666,6 +666,16 @@ fun tailForConsole(text: String, keep: Int = SHOWN_OUTPUT_LINES): String {
     return shown.joinToString("\n") { "   $it" }
 }
 
+/** Last [keep] lines of a growing log, reading only its end: cheap enough to poll while a job runs. */
+fun tailLines(file: File, keep: Int = SHOWN_OUTPUT_LINES, window: Int = 8192): List<String> {
+    val from = maxOf(0L, file.length() - window)
+    val buf = ByteArray(window)
+    val n = java.io.RandomAccessFile(file, "r").use { it.seek(from); it.read(buf) }
+    val text = if (n > 0) String(buf, 0, n) else ""
+    val lines = collapseCarriageReturns(text).lines().dropLastWhile { it.isEmpty() }
+    return lines.drop(if (from > 0) 1 else 0).takeLast(keep) // a mid-file start cuts the first line
+}
+
 /** Caps output, keeping head and tail: build failures land at the end. */
 fun truncate(text: String, limit: Int = MAX_OUTPUT_CHARS): String {
     if (text.length <= limit) return text
@@ -778,6 +788,8 @@ class BackgroundJob(
         return false
     }
 
+    fun tail() = tailLines(logFile)
+
     /** The output so far. [note] replaces the status line. */
     fun report(note: String? = null) = buildString {
         // At read time: a \r frame can straddle two writes.
@@ -830,10 +842,12 @@ class JobRegistry(
     fun run(command: String, seconds: Long, cancelled: () -> Boolean): BackgroundJob {
         val job = launch("foreground", command)
         foreground = job
+        Spinner.start("Running") { job.tail() }
         try {
             if (!job.await(seconds, cancelled)) { job.stop(); job.await(2) }
             return job
         } finally {
+            Spinner.stop()
             foreground = null
         }
     }
@@ -980,19 +994,28 @@ object Spinner {
     private val enabled = System.console()?.isTerminal() == true
     private var worker: Thread? = null
 
+    /** [tail] lines are painted under the spinner and redrawn each frame. */
     @Synchronized
-    fun start(text: String) {
+    fun start(text: String, tail: () -> List<String> = { emptyList() }) {
         if (!enabled || worker != null) return
         val startedAt = System.currentTimeMillis()
         worker = thread(isDaemon = true) {
             var frame = 0
+            var painted = 0
             try {
                 while (true) {
-                    print("\r\u001B[2K${"⠹⠸⠴⠦⠇⠏"[frame++ % 6]} $text ${(System.currentTimeMillis() - startedAt) / 1000}s")
+                    val lines = tail()
+                    // Autowrap off: a long line must stay one row, or the cursor-up count is wrong.
+                    print("\u001B[?7l\r\u001B[2K${"⠹⠸⠴⠦⠇⠏"[frame++ % 6]} $text ${(System.currentTimeMillis() - startedAt) / 1000}s")
+                    // Clear as many rows as the previous frame used, so a shrinking tail leaves nothing behind.
+                    repeat(maxOf(lines.size, painted)) { print("\n\u001B[2K" + (lines.getOrNull(it)?.let { l -> "   $l" } ?: "")) }
+                    painted = maxOf(lines.size, painted)
+                    if (painted > 0) print("\u001B[${painted}A")
+                    print("\u001B[?7h")
                     Thread.sleep(90)
                 }
             } catch (_: InterruptedException) {
-                print("\r\u001B[2K")
+                print("\r\u001B[2K" + "\n\u001B[2K".repeat(painted) + (if (painted > 0) "\u001B[${painted}A" else ""))
             }
         }
     }
