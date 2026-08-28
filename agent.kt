@@ -500,11 +500,9 @@ fun printHelp() = println(
       /help    Show this help
       /reset   Clear the conversation history
       /exit    Quit (or Ctrl+D)
-    Arrow keys edit the line; Up/Down recall earlier prompts (kept in ~/.agent_history).
-    End a line with \ to continue on the next line; pasted newlines are kept as-is.
     Ctrl+C cancels the running task; at the prompt it quits.
     Background jobs survive /reset and a cancelled task; they die with the session.
-    Note: requests use store=true, so OpenAI retains this session for about 30 days.
+    Note: OpenAI caching retains this session for about 30 days.
     Piped stdin (echo "…" | ./agent.kt) runs that one prompt: answer on stdout, log on stderr, then exit.
     """.trimIndent()
 )
@@ -565,7 +563,6 @@ private fun runConsole(workspace: File, apiKey: String, log: JsonlLog?) {
     val terminal = TerminalBuilder.builder().system(true).build()
     val reader = LineReaderBuilder.builder()
         .terminal(terminal)
-        .variable(LineReader.HISTORY_FILE, File(System.getProperty("user.home"), ".agent_history"))
         // Trailing \ + Enter continues on the next line; the buffer then edits as real multi-line.
         .parser(DefaultParser().eofOnEscapedNewLine(true))
         .variable(LineReader.SECONDARY_PROMPT_PATTERN, "    ...  ")

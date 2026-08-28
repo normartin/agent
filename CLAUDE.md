@@ -58,7 +58,7 @@ The code should stay short and readable. If new features required signigificantl
   keys on, and item 0 changing every turn would forfeit the cached discount on
   the whole history.
 - The console line is read by JLine (raw tty mode, so arrows edit and ↑/↓ recall
-  from `~/.agent_history`), and only on demand: the reader thread waits on a
+  earlier prompts — in-memory only, never written to a history file), and only on demand: the reader thread waits on a
   semaphore the main loop releases once per prompt, because an active
   `readLine` paints the prompt and must not overlap a task's streaming output.
   JLine enables application-cursor mode, so arrows arrive as `\eOD` etc.
@@ -74,7 +74,7 @@ The code should stay short and readable. If new features required signigificantl
 - The log records each request body verbatim as JSON (`JsonlLog` in `agent.kt`), which is the way
   to check that the prompt-cache prefix really is stable turn to turn. Sub-agents inherit
   `AGENT_LOG` and append to the same file; `pid` and `depth` tell their lines apart.
-- Comments explain *why* a choice was made. Keep that style. Keep them very short. Usually 1 or 2 lines.
+- Comments explain *why* a choice was made. Keep that style. Keep them very short. Usually 1 or 2 lines. No historic context.
 
 ## Agent Execution Policy (Default)
 
