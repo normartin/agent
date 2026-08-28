@@ -62,6 +62,9 @@ The code should stay short and readable. If new features required signigificantl
   semaphore the main loop releases once per prompt, because an active
   `readLine` paints the prompt and must not overlap a task's streaming output.
   JLine enables application-cursor mode, so arrows arrive as `\eOD` etc.
+  Multi-line input is `DefaultParser().eofOnEscapedNewLine(true)`: a trailing `\` continues the
+  line; the reader thread strips the `\` markers, keeping the newlines. That strip needs
+  `DISABLE_EVENT_EXPANSION`, or JLine itself rewrites the line (drops `\x` escapes, `!` history).
 - One-shot mode swaps `System.out` for stderr instead of plumbing a logger
   through the harness; the real stdout is kept aside for the answer only.
 - Sub-agents are not a separate mechanism: they are this program in one-shot
