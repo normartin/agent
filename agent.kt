@@ -134,8 +134,8 @@ val SUMMARY_PROMPT = """
     error messages and numbers. Plain text, no preamble.
 """.trimIndent()
 
-// One tool, five actions, resent every turn. Strict requires every property, so optionals are nullable:
-// that gives the model a legal way to omit a field instead of inventing filler.
+// One tool, five actions, resent every turn. We mark all fields required, so optionals are nullable:
+// that gives the model a legal way to omit a field as null instead of inventing filler.
 val TOOLS = buildJsonArray {
     addJsonObject {
         put("type", "function")
@@ -502,7 +502,7 @@ fun printHelp() = println(
       /exit    Quit (or Ctrl+D)
     Ctrl+C cancels the running task; at the prompt it quits.
     Background jobs survive /reset and a cancelled task; they die with the session.
-    Note: OpenAI caching retains this session for about 30 days.
+    Note: prompt cache retention is requested at 24h for this session.
     Piped stdin (echo "…" | ./agent.kt) runs that one prompt: answer on stdout, log on stderr, then exit.
     """.trimIndent()
 )
