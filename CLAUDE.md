@@ -18,7 +18,10 @@ The code should stay short and readable. If new features required signigificantl
 
 - `./gradlew test` — run the suite (`useJUnitPlatform()` is required for Kotest).
   Specs run concurrently, one thread each (`src/test/kotlin/ProjectConfig.kt`); a spec that swaps
-  `System.out` or other global state must be marked `@Isolate`.
+  `System.out` or other global state must be marked `@Isolate`. `ConsoleTest` is the only spec that
+  reaches the console loop: it spawns the compiled agent under `script`'s pty (a JVM per test, slow
+  by design) and syncs typing on JLine's `ESC[?1h`, since the prompt text is not rendered reliably there.
+  It is experimental: remove it if it becomes a maintenance burden.
 - `./gradlew run` — start the console. Needs `OPENAI_API_KEY`.
 - `OPENAI_BASE_URL` redirects the API to a proxy or local server.
 - `AGENT_LOG` names a JSON-lines logfile (default `agent-YYYYMMDD-HHMMSS.jsonl`, local time, per session in the cwd; set it empty to
