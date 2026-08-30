@@ -646,7 +646,10 @@ private fun runConsole(workspace: File, apiKey: String, log: JsonlLog?) {
                     "/help" -> printHelp()
                     "/reset" -> { harness.reset(); println("🧹  History cleared.") }
                     "/plan" -> { plan = !plan; println(if (plan) "📋  Plan mode on: read-only, answers with a plan. /plan again to leave." else "🔧  Plan mode off.") }
-                    else -> { println(); harness.runTask(line, plan) }
+                    else -> if (line.startsWith("/")) {
+                        println("❌  Unknown command")
+                        printHelp()
+                    } else { println(); harness.runTask(line, plan) }
                 }
             }
         }
