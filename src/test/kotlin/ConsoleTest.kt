@@ -5,23 +5,13 @@ import io.kotest.matchers.string.shouldContain
 import io.kotest.matchers.string.shouldStartWith
 
 /**
- * The console only runs on a tty, so these drive the compiled agent under `script`'s pseudo-terminal.
+ * The console only runs on a tty, so these drive the compiled agent on a pty4j pseudo-terminal.
  * Slow by design (a JVM per test): keep it to smoke tests of what nothing else can reach.
  * Experimental: if it turns flaky or costly to maintain, delete it rather than nurse it.
  */
 class ConsoleTest : FunSpec({
 
     val workspace = tempdir()
-
-    test("an unknown /command is rejected with help and never reaches the model") {
-        MockOpenAi().use { mock ->
-            val out = console(workspace, mock) { line("/foo"); line("/exit") }
-            out shouldContain "Bash Agent — Workspace"
-            out shouldContain "Unknown command"
-            out shouldContain "Bye!"
-            mock.requests.size shouldBe 0
-        }
-    }
 
     test("a job finishing while the user is idle at the prompt starts a turn by itself") {
         MockOpenAi().use { mock ->

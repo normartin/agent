@@ -6,4 +6,4 @@ docker run -it --rm \
   -v jbang-cache:/root/.jbang \
   -v "$(pwd)":/project \
   -w /project \
-  nixos/nix nix-shell -p python3 nodejs git temurin-bin-25 '(jbang.override { jdk = jdk25; })' perl jq curl git
+  nixos/nix nix-shell -p python3 nodejs git temurin-bin-25 '(jbang.override { jdk = jdk25; })' perl jq curl git fish --command fish

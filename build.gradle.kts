@@ -8,6 +8,8 @@ plugins {
 
 repositories {
     mavenCentral()
+    // jediterm-core is published here, not on Maven Central. Test scope only.
+    maven("https://packages.jetbrains.team/maven/p/ij/intellij-dependencies")
 }
 
 // The harness is deliberately a single file at the repo root, so that it stays
@@ -46,6 +48,10 @@ dependencies {
     testImplementation("io.kotest:kotest-assertions-core:6.2.4")
     testImplementation("io.kotest:kotest-property:6.2.4")
     testImplementation("com.approvaltests:approvaltests:31.0.0")
+    // Headless terminal emulation for the console tests: pty4j spawns the agent
+    // on a real pty, jediterm renders its output into a text screen.
+    testImplementation("org.jetbrains.jediterm:jediterm-core:3.74")
+    testImplementation("org.jetbrains.pty4j:pty4j:0.13.12")
 }
 
 kotlin {

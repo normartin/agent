@@ -4,14 +4,16 @@ import MockOpenAi
 import answer
 import bash
 import console
-import reasoning
-import turn
 import io.kotest.core.spec.style.FunSpec
+import io.kotest.core.test.TestScope
 import io.kotest.engine.spec.tempdir
+import io.kotest.matchers.shouldBe
 import org.approvaltests.Approvals
 import org.approvaltests.core.Options
 import org.approvaltests.namer.NamerWrapper
 import org.approvaltests.reporters.QuietReporter
+import reasoning
+import turn
 
 /**
  * Approval tests to make changes in the UI visible. Failure is expected when we change the UI.
@@ -21,38 +23,36 @@ class ConsoleApprovalTest : FunSpec({
 
     val workspace = tempdir()
 
-    /** ApprovalTests' default namer needs a JUnit frame Kotest doesn't have, so name the file explicitly. */
-    fun verify(name: String, text: String) {
+    /** ApprovalTests' default namer needs a JUnit frame Kotest doesn't have, so the test name names the file. */
+    fun TestScope.verify(out: String) {
+        // The tempdir varies between runs; everything else is the rendered screen, stable as-is.
+        val scrubbed = out.replace(Regex("Workspace: .*"), "Workspace: <workspace>")
         // Only a human in the IDE gets the diff tool on mismatch; terminal and CI runs just fail.
-        val options = if (System.getProperty("idea.active").toBoolean()) Options()
+        val options = if (System.getProperty("idea.active", "false").toBoolean()) Options()
                       else Options().withReporter(QuietReporter())
-        Approvals.verify(text, options.forFile().withNamer(
-            NamerWrapper({ "ConsoleApprovalTest.$name" }, { "src/test/kotlin/approvals" })))
+        Approvals.verify(scrubbed, options.forFile().withNamer(
+            NamerWrapper(
+                { "ConsoleApprovalTest.${testCase.name.name.replace(' ', '_')}" },
+                { "src/test/kotlin/approvals" })
+        ))
     }
 
-    /** The tempdir varies between runs, and spinner frames plus their re-painted tail depend on timing. */
-    fun scrub(out: String) = out
-        .replace(Regex("Workspace: .*"), "Workspace: <workspace>")
-        .replace(Regex("[⠹⠸⠴⠦⠇⠏] \\S+ \\d+s"), "")
-        .lines().filterNot { it.isBlank() }
-        .fold(mutableListOf<String>()) { acc, l -> if (acc.lastOrNull() != l) acc += l; acc }
-        .joinToString("\n")
-
-    test("check welcome screen") {
+    test("welcome screen") {
         MockOpenAi().use { mock ->
-            val out = console(workspace, mock) { line("/exit") }
-            verify("check_welcome_screen", scrub(out))
+            val out = console(workspace, mock) { line("/foo"); line("/exit") }
+            mock.requests.size shouldBe 0 // an unknown /command never reaches the model
+            verify(out)
         }
     }
 
-    test("check user input and tool call") {
+    test("user input and tool call") {
         MockOpenAi().use { mock ->
             mock.script(
                 turn(reasoning("Just echo it"), bash(command = "echo hello")),
                 turn(answer("The command printed hello."))
             )
             val out = console(workspace, mock) { line("say hello"); line("/exit") }
-            verify("check_tool_call", scrub(out))
+            verify(out)
         }
     }
 })
