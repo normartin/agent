@@ -35,6 +35,9 @@ class Session(
         stdin.write("$text\n".toByteArray()); stdin.flush()
     }
     fun awaitRequests(n: Int) = await("$n requests") { mock.requests.size >= n }
+    fun awaitScreen(text: String) = await("\"$text\" on screen") { snapshot(buffer).contains(text) }
+    /** Ctrl+C as a tty delivers it: in cooked mode (task running) it becomes SIGINT to the agent's process group. */
+    fun interrupt() { stdin.write(3); stdin.flush() }
 }
 
 private const val COLS = 120

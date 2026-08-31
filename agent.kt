@@ -15,6 +15,7 @@ import org.jline.reader.UserInterruptException
 import org.jline.reader.Widget
 import org.jline.reader.impl.DefaultParser
 import org.jline.reader.impl.LineReaderImpl
+import org.jline.terminal.Terminal
 import org.jline.terminal.TerminalBuilder
 import org.jline.utils.InfoCmp
 import sun.misc.Signal
@@ -28,9 +29,11 @@ import java.time.Instant
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter.ofPattern
 import java.util.Locale
+import java.util.concurrent.ExecutionException
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.Semaphore
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.TimeoutException
 import kotlin.concurrent.thread
 import kotlin.system.exitProcess
 
@@ -45,7 +48,7 @@ const val OUTPUT_USD_PER_1M = 14.00
 
 const val MAX_ITERATIONS = 25
 const val TIMEOUT_SECONDS = 120L       // foreground command deadline
-// One API call. A think over a big tool result runs minutes, and an in-flight request cannot be cancelled.
+// One API call. A think over a big tool result runs minutes; Ctrl+C cancels the in-flight request.
 const val API_TIMEOUT_SECONDS = 600L
 const val DEFAULT_WAIT_SECONDS = 60L
 const val MAX_WAIT_SECONDS = 600L
@@ -246,10 +249,10 @@ class BashAgentHarness(
         }
     }
 
-    /** Cancels the running task, foreground command included. Background jobs live on. */
+    /** Cancels the running task; a foreground command survives as a background job. */
     fun interrupt() {
+        jobs.backgroundForeground() // before the flag: run() must never see it and kill the moved job
         interrupted = true
-        jobs.interruptForeground()
     }
 
     override fun close() {
@@ -377,12 +380,18 @@ class BashAgentHarness(
             "run" -> {
                 println("💻  Bash: $command")
                 val job = jobs.run(command!!, timeoutSeconds) { interrupted }
-                val note = when {
-                    job.state != JobState.KILLED -> null
-                    interrupted -> "[Interrupted by the user — process killed]"
-                    else -> "[TIMED OUT after ${timeoutSeconds}s — process killed. Output above is partial.]"
+                if (job.name != "foreground") { // renamed only when Ctrl+C moved it to the background
+                    println("📦  Moved to background job \"${job.name}\"")
+                    "Interrupted by the user — the command continues as background job \"${job.name}\". " +
+                        "Its output will be delivered to you when it finishes."
+                } else {
+                    val note = when {
+                        job.state != JobState.KILLED -> null
+                        interrupted -> "[Interrupted by the user — process killed]"
+                        else -> "[TIMED OUT after ${timeoutSeconds}s — process killed. Output above is partial.]"
+                    }
+                    job.report(note)
                 }
-                job.report(note)
             }
 
             "start" -> {
@@ -502,6 +511,7 @@ private sealed interface Event {
     data class Typed(val line: String) : Event
     data object EndOfInput : Event
     data object JobFinished : Event
+    data object Interrupted : Event // Ctrl+C during a resumed turn: re-prompt, don't quit
 }
 
 fun printHelp() = println(
@@ -511,7 +521,7 @@ fun printHelp() = println(
       /plan    Toggle plan mode (or Shift-Tab): the model explores read-only and answers with a plan
       /reset   Clear the conversation history
       /exit    Quit (or Ctrl+D)
-    Ctrl+C cancels the running task; at the prompt it quits.
+    Ctrl+C cancels the running task (a running command is moved to a background job); at the prompt it quits.
     Background jobs survive /reset and a cancelled task; they die with the session.
     Note: prompt cache retention is requested at 24h for this session.
     Piped stdin (echo "…" | ./agent.kt) runs that one prompt: answer on stdout, log on stderr, then exit.
@@ -588,7 +598,9 @@ private fun runConsole(workspace: File, apiKey: String, log: JsonlLog?) {
     // Covers every exit path.
     Runtime.getRuntime().addShutdownHook(thread(start = false) { harness.close() })
 
-    Signal.handle(Signal("INT")) {
+    // Via the terminal, not sun.misc: readLine saves/restores the terminal's INT handler around
+    // every prompt, so a raw sun.misc registration is clobbered back to SIG_DFL after the first one.
+    terminal.handle(Terminal.Signal.INT) {
         if (harness.busy) harness.interrupt() else { farewell(); exitProcess(0) }
     }
 
@@ -616,7 +628,8 @@ private fun runConsole(workspace: File, apiKey: String, log: JsonlLog?) {
             } catch (_: EndOfFileException) {
                 Event.EndOfInput
             } catch (_: UserInterruptException) { // Ctrl+C caught by JLine before our handler
-                Event.EndOfInput
+                // Interrupt here, not in the main loop: it is inside resume() and would see the event too late.
+                if (harness.busy) { harness.interrupt(); Event.Interrupted } else Event.EndOfInput
             }
             events.put(event)
             if (event == Event.EndOfInput) break
@@ -631,6 +644,7 @@ private fun runConsole(workspace: File, apiKey: String, log: JsonlLog?) {
         }
         when (val event = events.take()) {
             Event.EndOfInput -> break
+            Event.Interrupted -> prompted = false // the aborted readLine consumed the permit; paint a fresh prompt
             Event.JobFinished -> {
                 // readLine is still active on the reader thread (it cannot be cancelled), so a turn's output
                 // scrolls its prompt away; redraw is the only cross-thread call JLine allows.
@@ -749,12 +763,13 @@ enum class JobState { RUNNING, EXITED, KILLED }
 
 /** One command detached from the turn that started it. Its output goes straight to [logFile]; a daemon thread reaps it. */
 class BackgroundJob(
-    val name: String,
+    name: String,
     val command: String,
     private val process: Process,
     val logFile: File,
-    private val onFinished: (BackgroundJob) -> Unit = {}
+    private var onFinished: (BackgroundJob) -> Unit = {}
 ) {
+    @Volatile var name = name; private set
     val startedAt = System.currentTimeMillis()
 
     @Volatile var state = JobState.RUNNING; private set
@@ -779,6 +794,15 @@ class BackgroundJob(
         exitCode = code
         if (state == JobState.RUNNING) state = JobState.EXITED
         finishedAt = System.currentTimeMillis()
+    }
+
+    /** Adopts a new name and callback; refused once done (the watcher already fired the old one). */
+    @Synchronized
+    fun handOff(newName: String, callback: (BackgroundJob) -> Unit): Boolean {
+        if (done) return false
+        name = newName
+        onFinished = callback
+        return true
     }
 
     @Synchronized
@@ -837,7 +861,9 @@ class JobRegistry(
         // sees, so the marker's line numbers are exact and nothing is lost however much a job prints.
         val logFile = File.createTempFile("agent-", ".log")
         // A NUL cannot cross execve, and the model occasionally emits one; stripping beats failing the call.
-        val process = ProcessBuilder("bash", "-c", command.replace("\u0000", ""))
+        // trap '' INT: the tty's Ctrl+C signals the whole process group, and a job (descendants
+        // included, they inherit the ignore) must survive the very interrupt that backgrounds it.
+        val process = ProcessBuilder("bash", "-c", "trap '' INT; " + command.replace("\u0000", ""))
             .directory(workspace)
             .redirectInput(ProcessBuilder.Redirect.from(File("/dev/null"))) // never block on input
             .redirectErrorStream(true)
@@ -861,7 +887,8 @@ class JobRegistry(
         foreground = job
         Spinner.start("Running") { job.tail() }
         try {
-            if (!job.await(seconds, cancelled)) { job.stop(); job.await(2) }
+            // foreground is null once backgroundForeground() moved the job: then it must live on.
+            if (!job.await(seconds, cancelled) && foreground != null) { job.stop(); job.await(2) }
             return job
         } finally {
             Spinner.stop()
@@ -869,7 +896,14 @@ class JobRegistry(
         }
     }
 
-    fun interruptForeground() { foreground?.stop() }
+    /** Ctrl+C: the foreground command becomes a named background job instead of dying. */
+    @Synchronized
+    fun backgroundForeground() {
+        val job = foreground ?: return
+        if (!job.handOff(nameFor(null), onFinished)) return
+        jobs[job.name] = job
+        foreground = null
+    }
 
     /** Never reused: a second "build" becomes "build-2". */
     private fun nameFor(requested: String?): String {
@@ -949,7 +983,7 @@ fun callOpenAI(
         // JSON, not a string, so jq can dig into it; the key lives in the header only.
         log?.event("request") { put("attempt", attempt); put("url", url); put("body", payload) }
         val started = System.nanoTime()
-        val response = client.send(request, HttpResponse.BodyHandlers.ofString())
+        val response = sendCancellable(client, request, cancelled)
         val status = response.statusCode()
         log?.event("response") {
             put("attempt", attempt)
@@ -967,6 +1001,16 @@ fun callOpenAI(
         println("⏳ %d from the API — retrying in %.1fs (attempt %d/%d)".format(Locale.ROOT, status, waitMs / 1000.0, attempt, MAX_RETRIES))
         Spinner.start("Waiting")
         if (!sleepUnlessCancelled(waitMs, cancelled)) throw Exception("Cancelled while waiting out a rate limit.")
+    }
+}
+
+/** send() cannot be cancelled; poll the future in slices so Ctrl+C is felt. A response beats a pending cancel. */
+private fun sendCancellable(client: HttpClient, request: HttpRequest, cancelled: () -> Boolean): HttpResponse<String> {
+    val future = client.sendAsync(request, HttpResponse.BodyHandlers.ofString())
+    while (true) {
+        try { return future.get(200, TimeUnit.MILLISECONDS) }
+        catch (_: TimeoutException) { if (cancelled()) { future.cancel(true); throw Exception("Cancelled by user.") } }
+        catch (e: ExecutionException) { throw e.cause ?: e } // unwrap: the IOException message is the useful one
     }
 }
 

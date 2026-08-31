@@ -30,4 +30,27 @@ class ConsoleTest : FunSpec({
             mock.requests[2].input.last().str("content")!! shouldStartWith "[background job"
         }
     }
+
+    test("Ctrl+C during a foreground command backgrounds it instead of quitting") {
+        MockOpenAi().use { mock ->
+            mock.script(
+                turn(reasoning(), bash(command = "sleep 2; echo survived")),
+                turn(answer("saw it"))
+            )
+            val out = console(workspace, mock) {
+                line("run it")
+                awaitScreen("Running") // the spinner: the foreground wait is underway
+                interrupt()
+                awaitScreen("Moved to background job")
+                awaitRequests(2) // the moved job finishing starts a turn on its own
+                line("/exit")
+            }
+            out shouldContain "Interrupted"
+            out shouldContain "saw it"
+            val delivered = mock.requests[1].input
+            delivered.first { it.str("type") == "function_call_output" }
+                .str("output")!! shouldContain "continues as background job"
+            delivered.last().str("content")!! shouldContain "survived"
+        }
+    }
 })

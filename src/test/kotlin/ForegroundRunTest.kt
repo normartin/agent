@@ -3,6 +3,7 @@ import io.kotest.engine.spec.tempdir
 import io.kotest.matchers.longs.shouldBeGreaterThanOrEqual
 import io.kotest.matchers.longs.shouldBeLessThan
 import io.kotest.matchers.shouldBe
+import io.kotest.matchers.shouldNotBe
 import io.kotest.matchers.string.shouldContain
 import io.kotest.matchers.string.shouldNotContain
 import io.kotest.matchers.string.shouldStartWith
@@ -78,7 +79,7 @@ class ForegroundRunTest : FunSpec({
         shouldLeaveNoProcess(marker)
     }
 
-    test("an interrupt is felt during the command, not after it") {
+    test("an interrupt moves the command to a background job instead of killing it") {
         val marker = "kotest-foreground-interrupt-marker"
         val jobs = JobRegistry(workspace)
         var interrupted = false
@@ -87,16 +88,38 @@ class ForegroundRunTest : FunSpec({
         val runner = thread { job = jobs.run("sleep 300 # $marker", 600) { interrupted } }
 
         Thread.sleep(500)
-        val killedAt = System.currentTimeMillis()
+        val movedAt = System.currentTimeMillis()
+        jobs.backgroundForeground() // before the flag, in harness.interrupt()'s order
         interrupted = true
-        jobs.interruptForeground()
         runner.join(15_000)
 
-        (System.currentTimeMillis() - killedAt) shouldBeLessThan 5_000L
+        (System.currentTimeMillis() - movedAt) shouldBeLessThan 5_000L
         runner.isAlive shouldBe false
-        job!!.state shouldBe JobState.KILLED
+        val moved = job!!
+        moved.state shouldBe JobState.RUNNING
+        moved.name shouldNotBe "foreground"
+        jobs.find(moved.name) shouldBe moved // registered, so wait/stop/output can reach it
 
+        moved.stop()
+        moved.await(5)
         shouldLeaveNoProcess(marker)
+    }
+
+    test("a moved job still delivers its result when it finishes") {
+        var finished: BackgroundJob? = null
+        val jobs = JobRegistry(workspace) { finished = it }
+        var interrupted = false
+        var job: BackgroundJob? = null
+        val runner = thread { job = jobs.run("sleep 1", 600) { interrupted } }
+
+        Thread.sleep(300)
+        jobs.backgroundForeground()
+        interrupted = true
+        runner.join(15_000)
+
+        job!!.await(10) shouldBe true
+        finished shouldBe job // the hand-off swapped in the registry's callback
+        jobs.drainFinished() shouldBe listOf(job)
     }
 
     test("a foreground command is never registered as a job") {
@@ -141,6 +164,23 @@ class ForegroundRunTest : FunSpec({
             // "[Killed after 1s]" is what the job itself would say, which does
             // not tell the model whether it was the deadline or the user.
             mock.requests[1].input.last().str("output")!! shouldContain "TIMED OUT after 1s"
+        }
+    }
+
+    test("the moved-to-background wording reaches the model, and the turn stops") {
+        MockOpenAi().use { mock ->
+            mock.script(
+                turn(reasoning(), bash(command = "sleep 300")),
+                turn(answer("ok"))
+            )
+            BashAgentHarness(workspace, "test-key", mock.baseUrl).use { harness ->
+                thread { Thread.sleep(500); harness.interrupt() }
+                harness.runTask("hang") shouldBe null      // interrupted: the turn ends
+                harness.runTask("and then?") shouldBe "ok" // the reply went into history for the next turn
+            }
+
+            val output = mock.requests[1].input.first { it.str("type") == "function_call_output" }.str("output")!!
+            output shouldContain "continues as background job"
         }
     }
 })

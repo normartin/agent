@@ -1,3 +1,4 @@
+import com.sun.net.httpserver.HttpServer
 import io.kotest.assertions.throwables.shouldThrow
 import io.kotest.core.spec.style.FunSpec
 import io.kotest.matchers.longs.shouldBeLessThan
@@ -11,7 +12,10 @@ import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
+import java.net.InetSocketAddress
 import java.net.http.HttpClient
+import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.concurrent.thread
 
 private val client: HttpClient = HttpClient.newHttpClient()
 
@@ -281,6 +285,26 @@ class ApiProtocolTest : FunSpec({
 
                 (System.currentTimeMillis() - started) shouldBeLessThan 5_000L
                 mock.requests.size shouldBe 1
+            }
+        }
+
+        test("cancelling an in-flight request abandons it instead of awaiting the response") {
+            // The server never answers: only the cancel can end the call in time.
+            val server = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
+            server.createContext("/v1/responses") { Thread.sleep(60_000) }
+            server.start()
+            try {
+                val cancelled = AtomicBoolean(false)
+                thread { Thread.sleep(150); cancelled.set(true) }
+                val started = System.currentTimeMillis()
+
+                shouldThrow<Exception> {
+                    callOpenAI(client, history, "test-key", "http://127.0.0.1:${server.address.port}", cancelled = { cancelled.get() })
+                }.message.shouldNotBeNull() shouldContain "Cancelled"
+
+                (System.currentTimeMillis() - started) shouldBeLessThan 5_000L
+            } finally {
+                server.stop(0)
             }
         }
     }
