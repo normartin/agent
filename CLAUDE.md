@@ -56,7 +56,8 @@ The code should stay short and readable. If new features required signigificantl
 - Expect a one-off `cached_tokens` dip on the first request after an assistant turn completes: the API
   drops that turn's reasoning items server-side, shifting the resolved token stream even though the
   logged prefix is unchanged (billed input shrinks too). Not a harness bug; the cache re-warms next request.
-- Past `MAX_HISTORY_CHARS` the oldest turns are dropped and replaced by a model-written summary
+- Past `MAX_HISTORY_TOKENS` — measured, the last request's `usage` tokens, so one call stale — the
+  oldest turns are dropped (chars apportion where the cut lands) and replaced by a model-written summary
   (`trimHistory` + `summarize`): one tool-less call over the dropped span, inserted as a *user* item at
   index 1. Never item 0, so the cached prefix survives the trim; on failure the plain trim still happens.
 - The console loop is event-driven: stdin is read on its own thread and pushed

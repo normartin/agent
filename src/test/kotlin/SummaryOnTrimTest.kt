@@ -12,15 +12,17 @@ import io.kotest.matchers.string.shouldNotContain
 class SummaryOnTrimTest : FunSpec({
 
     val workspace = tempdir()
-    // Three of these overflow MAX_HISTORY_CHARS; the trim drops the first two turns and keeps the third.
-    val big = "x".repeat(MAX_HISTORY_CHARS * 5 / 12)
+    val big = "x".repeat(50_000)
+    // The third reply measures the history over budget; keeping the TRIM_TARGET_TOKENS share (~45%
+    // of the chars) drops the first two turns and keeps the third.
+    val overBudget = MAX_HISTORY_TOKENS * 4L / 3
 
     test("the dropped turn is summarized and the summary sits behind an unchanged system prompt") {
         MockOpenAi().use { mock ->
             mock.script(
                 turn(answer("one")),
                 turn(answer("two")),
-                turn(answer("three")),
+                turn(answer("three"), input = overBudget),
                 turn(answer("Goal: keep going")),   // the summary call
                 turn(answer("four"))
             )
@@ -52,7 +54,7 @@ class SummaryOnTrimTest : FunSpec({
             mock.script(
                 turn(answer("one")),
                 turn(answer("two")),
-                turn(answer("three")),
+                turn(answer("three"), input = overBudget),
                 Reply(400, """{"error":{"message":"no summary for you"}}"""),
                 turn(answer("four"))
             )

@@ -66,11 +66,11 @@ const val MAX_INSTRUCTIONS_CHARS = 20_000
 
 // Sized against TPM, not the context window: the whole history is resent every iteration.
 const val MAX_OUTPUT_CHARS = 12_000
-const val MAX_HISTORY_CHARS = 120_000
+const val MAX_HISTORY_TOKENS = 30_000
 /** Console echo only; the model and the log always get the whole result. */
 const val SHOWN_OUTPUT_LINES = 5
 // Trimming forfeits the prompt cache behind the cut, so cut deep and rarely.
-const val TRIM_TARGET_CHARS = MAX_HISTORY_CHARS * 6 / 10
+const val TRIM_TARGET_TOKENS = MAX_HISTORY_TOKENS * 6 / 10
 // Tool results dominate the dropped span, and the summary only needs their gist.
 const val SUMMARY_RESULT_CHARS = 2_000
 
@@ -207,6 +207,8 @@ class BashAgentHarness(
     @Volatile var busy = false; private set
 
     private var session = Usage()
+    /** Last call's input+output: what the next request carries. Measured, so one call stale. */
+    private var contextTokens = 0L
 
     private val systemPrompt = systemPrompt(workspace, depth, subAgentCommand)
 
@@ -214,6 +216,7 @@ class BashAgentHarness(
 
     fun reset() {
         input.clear()
+        contextTokens = 0
         input.add(message("system", systemPrompt))
         interrupted = false
         log?.event("session") {
@@ -258,7 +261,6 @@ class BashAgentHarness(
         interrupted = false
         busy = true
         var used = Usage()
-        var last = Usage() // last call only: its input+output is what the next request would carry
         fun stopInterrupted(): Nothing? { println("\n⏹️ Interrupted. Ask again to continue."); return null }
         try {
             repeat(MAX_ITERATIONS) {
@@ -267,9 +269,10 @@ class BashAgentHarness(
                 // Logged after the trim, so chars_after is real; agent-log.kt reads all three keys.
                 val (itemsBefore, charsBefore) = input.size to input.sumOf { it.toString().length }
                 var summary: String? = null
-                trimHistory(input) { dropped -> summarize(dropped).also { summary = it } }
+                trimHistory(input, contextTokens) { dropped -> summarize(dropped).also { summary = it } }
                 if (input.size < itemsBefore) log?.event("trim") {
                     put("dropped", itemsBefore - input.size)
+                    put("context_tokens", contextTokens)
                     put("chars_before", charsBefore)
                     put("chars_after", input.sumOf { it.toString().length })
                     put("summary", summary)
@@ -286,7 +289,7 @@ class BashAgentHarness(
                     }
                 used += turn.usage
                 session += turn.usage
-                last = turn.usage
+                contextTokens = turn.usage.input + turn.usage.output
 
                 // Echoed back verbatim, reasoning included: that keeps the model's thinking alive.
                 turn.output.forEach { input.add(it.jsonObject) }
@@ -311,7 +314,7 @@ class BashAgentHarness(
             if (used.input > 0) println(
                 "📊  %,d in (%,d cached, %d%% hit) / %,d out (%,d reasoning) · \$%.4f · session \$%.4f · ctx %,d (%d%%)".format(
                     Locale.ROOT, used.input, used.cached, used.cached * 100 / used.input, used.output, used.reasoning,
-                    used.cost, session.cost, last.input + last.output, (last.input + last.output) * 100 / CONTEXT_WINDOW_TOKENS
+                    used.cost, session.cost, contextTokens, contextTokens * 100 / CONTEXT_WINDOW_TOKENS
                 )
             )
             busy = false // last: Ctrl+C reads it, and the turn is not over until its output has printed
@@ -464,16 +467,19 @@ fun message(role: String, content: String) = buildJsonObject {
 }
 
 /**
- * Past the budget, drops the oldest turns down to TRIM_TARGET_CHARS. Item 0 and the newest item survive.
+ * Past the budget, drops the oldest turns down to TRIM_TARGET_TOKENS. Item 0 and the newest item survive.
+ * [contextTokens] is the last call's measured size — one call stale, so an oversized tool result is sent
+ * once before triggering (bounded by MAX_OUTPUT_CHARS); chars apportion only where the cut lands.
  * [summarize] sees the dropped items; its text replaces them as one user item, so the cut still lands on a user turn.
  */
-fun trimHistory(input: MutableList<JsonObject>, summarize: (List<JsonObject>) -> String? = { null }) {
+fun trimHistory(input: MutableList<JsonObject>, contextTokens: Long, summarize: (List<JsonObject>) -> String? = { null }) {
+    if (contextTokens <= MAX_HISTORY_TOKENS) return
     var total = input.sumOf { it.toString().length }
-    if (total <= MAX_HISTORY_CHARS) return
+    val keepChars = total.toLong() * TRIM_TARGET_TOKENS / contextTokens
 
     val limit = input.size - 1
     var drop = 1
-    while (drop < limit && total > TRIM_TARGET_CHARS) total -= input[drop++].toString().length
+    while (drop < limit && total > keepChars) total -= input[drop++].toString().length
     // Resume on a user message: anything else is orphaned from its call or reasoning item (400).
     while (drop < limit && input[drop].str("role") != "user") drop++
     if (drop >= limit) drop = 1

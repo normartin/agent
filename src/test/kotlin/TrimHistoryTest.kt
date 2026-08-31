@@ -1,10 +1,11 @@
 import io.kotest.core.spec.style.FunSpec
 import io.kotest.matchers.collections.shouldContainExactly
-import io.kotest.matchers.comparables.shouldBeLessThanOrEqualTo
-import io.kotest.matchers.ints.shouldBeGreaterThan
+import io.kotest.matchers.ints.shouldBeLessThan
+import io.kotest.matchers.longs.shouldBeLessThanOrEqual
 import io.kotest.matchers.shouldBe
 import io.kotest.property.Arb
 import io.kotest.property.arbitrary.int
+import io.kotest.property.arbitrary.long
 import io.kotest.property.checkAll
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.buildJsonObject
@@ -59,91 +60,86 @@ private fun session(turns: Int, pad: Int): MutableList<JsonObject> {
 
 private fun size(input: List<JsonObject>) = input.sumOf { it.toString().length }
 
+// The trigger is the measured token count of the last request, not the history's chars.
+private const val OVER_BUDGET = MAX_HISTORY_TOKENS * 2L
+
 class TrimHistoryTest : FunSpec({
 
-    test("a history inside the budget is left alone") {
-        val input = session(turns = 2, pad = 10)
+    test("a history measured inside the budget is left alone") {
+        val input = session(turns = 40, pad = 6_000)
         val before = input.toList()
-        trimHistory(input)
+        trimHistory(input, MAX_HISTORY_TOKENS.toLong())
         input shouldContainExactly before
     }
 
-    test("an oversized history is actually shrunk") {
-        val input = session(turns = 40, pad = MAX_HISTORY_CHARS / 20)
+    test("a history measured over the budget is actually shrunk") {
+        val input = session(turns = 40, pad = 6_000)
         val before = size(input)
-        before shouldBeGreaterThan MAX_HISTORY_CHARS
-
-        trimHistory(input)
-        size(input) shouldBeLessThanOrEqualTo before
+        trimHistory(input, OVER_BUDGET)
+        size(input) shouldBeLessThan before
     }
 
     test("the system prompt is never dropped") {
-        val input = session(turns = 40, pad = MAX_HISTORY_CHARS / 20)
-        trimHistory(input)
+        val input = session(turns = 40, pad = 6_000)
+        trimHistory(input, OVER_BUDGET)
         input.first().str("role") shouldBe "system"
         input.first().str("content") shouldBe "sys"
     }
 
     test("the newest item always survives") {
-        val input = session(turns = 40, pad = MAX_HISTORY_CHARS / 20)
+        val input = session(turns = 40, pad = 6_000)
         val newest = input.last()
-        trimHistory(input)
+        trimHistory(input, OVER_BUDGET)
         input.last() shouldBe newest
     }
 
     test("history always resumes on a user message") {
         // Anything else is orphaned from its function_call or reasoning item: a 400.
-        val input = session(turns = 40, pad = MAX_HISTORY_CHARS / 20)
-        trimHistory(input)
+        val input = session(turns = 40, pad = 6_000)
+        trimHistory(input, OVER_BUDGET)
         input[1].str("role") shouldBe "user"
     }
 
     test("a history with no turn boundary to resume on is left untouched") {
         // Mid tool-loop every cut orphans something; over budget beats a 400.
-        val pad = MAX_HISTORY_CHARS
         val input = mutableListOf(
             roleMsg("system", "sys"), roleMsg("user", "task"), reasoning(),
-            functionCall(), functionCallOutput("x".repeat(pad))
+            functionCall(), functionCallOutput("x".repeat(120_000))
         )
         val before = input.toList()
-        trimHistory(input)
+        trimHistory(input, OVER_BUDGET)
         input shouldContainExactly before
     }
 
     test("a single oversized item cannot empty the history") {
         val input = mutableListOf(
             roleMsg("system", "sys"),
-            roleMsg("user", "y".repeat(MAX_HISTORY_CHARS * 3))
+            roleMsg("user", "y".repeat(360_000))
         )
-        trimHistory(input)
+        trimHistory(input, OVER_BUDGET)
         kinds(input) shouldContainExactly listOf("system", "user")
     }
 
     test("a trim cuts down to the target, so the next few turns do not trim again") {
         // Each trim forfeits the prompt cache on the whole history; trimming to just under the
-        // budget would repeat that on every turn past it.
-        val input = session(turns = 40, pad = MAX_HISTORY_CHARS / 20)
-        trimHistory(input)
-        size(input) shouldBeLessThanOrEqualTo TRIM_TARGET_CHARS
+        // budget would repeat that on every turn past it. Chars apportion the cut: what survives
+        // is at most the TRIM_TARGET_TOKENS share of the measured tokens, in chars.
+        val input = session(turns = 40, pad = 6_000)
+        val before = size(input)
+        trimHistory(input, OVER_BUDGET)
+        size(input).toLong() shouldBeLessThanOrEqual before.toLong() * TRIM_TARGET_TOKENS / OVER_BUDGET
 
-        input.add(roleMsg("user", "z".repeat(MAX_HISTORY_CHARS / 20)))
+        // The next request re-measures the trimmed history: back around the target, so no new trim.
+        input.add(roleMsg("user", "z".repeat(6_000)))
         val afterOneMoreTurn = input.toList()
-        trimHistory(input)
+        trimHistory(input, TRIM_TARGET_TOKENS.toLong())
         input shouldContainExactly afterOneMoreTurn
     }
 
-    test("trimming twice changes nothing the second time") {
-        val input = session(turns = 40, pad = MAX_HISTORY_CHARS / 20)
-        trimHistory(input)
-        val once = input.toList()
-        trimHistory(input)
-        input shouldContainExactly once
-    }
-
     test("the summarizer sees exactly the dropped items and its text lands at index 1 as a user item") {
-        val input = session(turns = 40, pad = MAX_HISTORY_CHARS / 20)
+        val input = session(turns = 40, pad = 6_000)
         var seen: List<JsonObject>? = null
-        trimHistory(input) { dropped -> seen = dropped; "the gist" }
+        trimHistory(input, OVER_BUDGET) { dropped -> seen = dropped; "the gist" }
 
         val dropped = checkNotNull(seen)
         dropped.first() shouldBe roleMsg("user", "task 0")         // system prompt not offered up
@@ -154,18 +150,18 @@ class TrimHistoryTest : FunSpec({
     }
 
     test("a summarizer returning null falls back to the plain trim") {
-        val plain = session(turns = 40, pad = MAX_HISTORY_CHARS / 20)
-        trimHistory(plain)
-        val input = session(turns = 40, pad = MAX_HISTORY_CHARS / 20)
-        trimHistory(input) { null }
+        val plain = session(turns = 40, pad = 6_000)
+        trimHistory(plain, OVER_BUDGET)
+        val input = session(turns = 40, pad = 6_000)
+        trimHistory(input, OVER_BUDGET) { null }
         input shouldContainExactly plain
     }
 
     test("the invariants hold across arbitrary sessions and budget pressures") {
-        checkAll(200, Arb.int(1..30), Arb.int(1..16_000)) { turns, pad ->
+        checkAll(200, Arb.int(1..30), Arb.int(1..16_000), Arb.long(0L..150_000L)) { turns, pad, tokens ->
             val input = session(turns, pad)
             val newest = input.last()
-            trimHistory(input)
+            trimHistory(input, tokens)
 
             input.first().str("role") shouldBe "system"
             input.last() shouldBe newest
