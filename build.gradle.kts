@@ -45,6 +45,7 @@ dependencies {
     testImplementation("io.kotest:kotest-runner-junit5:6.2.4")
     testImplementation("io.kotest:kotest-assertions-core:6.2.4")
     testImplementation("io.kotest:kotest-property:6.2.4")
+    testImplementation("com.approvaltests:approvaltests:31.0.0")
 }
 
 kotlin {
@@ -63,6 +64,9 @@ java {
 tasks.test {
     // Required: without it Gradle finds zero Kotest tests and "passes".
     useJUnitPlatform()
+    // IntelliJ sets idea.active on every Gradle call it launches; hand it to the test JVM
+    // so approval mismatches only open a diff tool for a human in the IDE.
+    systemProperty("idea.active", providers.systemProperty("idea.active").getOrElse("false"))
     testLogging {
         events("passed", "skipped", "failed")
     }

@@ -1,0 +1,20 @@
+🤖  Bash Agent — Workspace: <workspace>
+Commands:
+  /help    Show this help
+  /plan    Toggle plan mode (or Shift-Tab): the model explores read-only and answers with a plan
+  /reset   Clear the conversation history
+  /exit    Quit (or Ctrl+D)
+Ctrl+C cancels the running task; at the prompt it quits.
+Background jobs survive /reset and a cancelled task; they die with the session.
+Note: prompt cache retention is requested at 24h for this session.
+Piped stdin (echo "…" | ./agent.kt) runs that one prompt: answer on stdout, log on stderr, then exit.
+👤  You: say hello
+🧠  Just echo it
+💻  Bash: echo hello
+📥  Output:
+   hello
+   [Exit Code: 0 after 0s]
+✅  The command printed hello.
+📊  2,000 in (0 cached, 0% hit) / 400 out (0 reasoning) · $0.0091 · session $0.0091
+👤  You: /exit
+👋  Bye! Session cost: $0.0091

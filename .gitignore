@@ -3,4 +3,5 @@ agent_workspace/
 build/
 .kotlin/
 agent*.jsonl
+*.received.txt
 !CLAUDE.md
