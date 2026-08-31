@@ -79,6 +79,9 @@ const val MAX_RETRY_WAIT_MS = 60_000L
 // One key per process, so parallel sub-agents with the same prompt do not compete for one cache node.
 val PROMPT_CACHE_KEY = "agent-" + java.util.UUID.randomUUID()
 
+// isTerminal(), not a null check: System.console() exists even for a pipe.
+val IS_TTY = System.console()?.isTerminal() == true
+
 // ---------- 1. What the model sees: system prompt and tool schema ----------
 
 /** Item 0 of every request. Stable by design: the prompt cache keys on it. */
@@ -105,12 +108,10 @@ fun systemPrompt(workspace: File, depth: Int = AGENT_DEPTH, subAgentCommand: Str
     that proves correctness. Prefer grep/sed one-liners over writing a script. Web pages: never print raw HTML;
     docs sites usually serve markdown at the URL with .md appended (or list pages in /llms.txt), otherwise strip
     tags (sed 's/<[^>]*>//g') and grep -C for what you need.
-""".trimIndent() + subAgentPrompt(depth, subAgentCommand) + instructionsPrompt(projectInstructions(workspace))
-
-/** Last, so the harness text ahead of it is identical in every project. */
-fun instructionsPrompt(instructions: String): String =
-    if (instructions.isBlank()) ""
-    else "\n\nProject instructions, read from the working directory at startup. Follow them:\n\n$instructions"
+""".trimIndent() + subAgentPrompt(depth, subAgentCommand) +
+    // Instructions last, so the harness text ahead of them is identical in every project.
+    projectInstructions(workspace).takeIf { it.isNotBlank() }
+        ?.let { "\n\nProject instructions, read from the working directory at startup. Follow them:\n\n$it" }.orEmpty()
 
 /** The instruction files present in [workspace], in [INSTRUCTION_FILES] order. */
 fun instructionFiles(workspace: File): List<File> =
@@ -148,46 +149,18 @@ val PLAN_NOTE = "\n\n[plan mode] Read-only: explore with bash (cat, grep, git lo
 
 // One tool, five actions, resent every turn. We mark all fields required, so optionals are nullable:
 // that gives the model a legal way to omit a field as null instead of inventing filler.
-val TOOLS = buildJsonArray {
-    addJsonObject {
-        put("type", "function")
-        put("name", "bash")
-        put("strict", true)
-        put(
-            "description",
-            "Run a shell command in the workspace (killed after ${TIMEOUT_SECONDS}s), " +
-                "or manage a background job that outlives the turn and is referred to by name."
-        )
-        putJsonObject("parameters") {
-            put("type", "object")
-            put("additionalProperties", false)
-            putJsonArray("required") { add("action"); add("command"); add("name"); add("seconds") }
-            putJsonObject("properties") {
-                putJsonObject("action") {
-                    put("type", "string")
-                    putJsonArray("enum") { add("run"); add("start"); add("output"); add("wait"); add("stop") }
-                    put(
-                        "description",
-                        "run: execute 'command' and wait. start: run it in the background. " +
-                            "output: what a job has printed so far. wait: block until it finishes. stop: kill it."
-                    )
-                }
-                putJsonObject("command") {
-                    putJsonArray("type") { add("string"); add("null") }
-                    put("description", "Shell command for run and start; null otherwise.")
-                }
-                putJsonObject("name") {
-                    putJsonArray("type") { add("string"); add("null") }
-                    put("description", "Job name for stop, output and wait; optional on start; null for run.")
-                }
-                putJsonObject("seconds") {
-                    putJsonArray("type") { add("number"); add("null") }
-                    put("description", "wait only: how long it may block (default $DEFAULT_WAIT_SECONDS, max $MAX_WAIT_SECONDS). Null otherwise.")
-                }
-            }
-        }
-    }
-}
+val TOOLS = Json.parseToJsonElement("""[{
+    "type": "function", "name": "bash", "strict": true,
+    "description": "Run a shell command in the workspace (killed after ${TIMEOUT_SECONDS}s), or manage a background job that outlives the turn and is referred to by name.",
+    "parameters": { "type": "object", "additionalProperties": false,
+        "required": ["action", "command", "name", "seconds"],
+        "properties": {
+            "action": { "type": "string", "enum": ["run", "start", "output", "wait", "stop"],
+                "description": "run: execute 'command' and wait. start: run it in the background. output: what a job has printed so far. wait: block until it finishes. stop: kill it." },
+            "command": { "type": ["string", "null"], "description": "Shell command for run and start; null otherwise." },
+            "name":    { "type": ["string", "null"], "description": "Job name for stop, output and wait; optional on start; null for run." },
+            "seconds": { "type": ["number", "null"], "description": "wait only: how long it may block (default $DEFAULT_WAIT_SECONDS, max $MAX_WAIT_SECONDS). Null otherwise." }
+        } } }]""").jsonArray
 
 // ---------- 2. Agent loop ----------
 
@@ -282,18 +255,13 @@ class BashAgentHarness(
         interrupted = false
         busy = true
         var used = Usage()
+        fun stopInterrupted(): Nothing? { println("\n⏹️ Interrupted. Ask again to continue."); return null }
         try {
             repeat(MAX_ITERATIONS) {
-                if (interrupted) { println("\n⏹️ Interrupted. Ask again to continue."); return null }
+                if (interrupted) return stopInterrupted()
                 pumpJobs(announceRunning = false)
-                val (itemsBefore, charsBefore) = input.size to input.sumOf { it.toString().length }
-                var summary: String? = null
-                trimHistory(input) { dropped -> summarize(dropped).also { summary = it } }
-                if (input.size < itemsBefore) log?.event("trim") {
-                    put("dropped", itemsBefore - input.size)
-                    put("chars_before", charsBefore)
-                    put("chars_after", input.sumOf { it.toString().length })
-                    put("summary", summary)
+                trimHistory(input) { dropped ->
+                    summarize(dropped).also { s -> log?.event("trim") { put("dropped", dropped.size); put("summary", s) } }
                 }
 
                 Spinner.start("Thinking")
@@ -301,8 +269,8 @@ class BashAgentHarness(
                     .also { Spinner.stop() }
                     .getOrElse { e ->
                         log?.event("error") { put("message", e.message ?: e.toString()) }
-                        if (interrupted) println("\n⏹️ Interrupted. Ask again to continue.")
-                        else println("❌  API Error: ${e.message ?: e}")
+                        if (interrupted) return stopInterrupted()
+                        println("❌  API Error: ${e.message ?: e}")
                         return null
                     }
                 used += turn.usage
@@ -370,9 +338,9 @@ class BashAgentHarness(
 
     private fun runBashCall(args: JsonObject, rawArgs: String): String {
         val name = args.str("name")
-        val action = args.str("action")?.lowercase() ?: "run"
+        val action = args.str("action") ?: "run" // strict schema: the enum arrives verbatim
         val command = args.str("command")
-        if (action in setOf("run", "start") && command.isNullOrBlank()) {
+        if ((action == "run" || action == "start") && command.isNullOrBlank()) {
             return "Execution Error: '$action' needs a 'command' (got: $rawArgs)"
         }
 
@@ -538,11 +506,10 @@ fun main() {
         System.err.println("❌  AGENT_DEPTH=$AGENT_DEPTH exceeds MAX_AGENT_DEPTH=$MAX_AGENT_DEPTH; refusing to nest deeper.")
         exitProcess(2)
     }
-    val workspace = File(".").apply { mkdirs() }.canonicalFile
+    val workspace = File(".").canonicalFile
     val log = resolveLogPath(System.getenv("AGENT_LOG"))?.let { JsonlLog(File(it)) }
 
-    // isTerminal(), not a null check: System.console() exists even for a pipe.
-    if (System.console()?.isTerminal() == true) runConsole(workspace, apiKey, log) else runOneShot(workspace, apiKey, log)
+    if (IS_TTY) runConsole(workspace, apiKey, log) else runOneShot(workspace, apiKey, log)
 }
 
 /** AGENT_LOG: unset -> one file per session (local time), blank -> off, otherwise the given path. */
@@ -674,7 +641,7 @@ private fun runConsole(workspace: File, apiKey: String, log: JsonlLog?) {
 // ---------- 4. Command execution and background jobs ----------
 
 /** How sub-agents launch this program. AGENT_CMD wins. */
-fun selfCommand(): String? =
+fun selfCommand(): String =
     System.getenv("AGENT_CMD")?.takeIf { it.isNotBlank() } ?: "./agent.kt"
 
 /** Optional tools on PATH, probed once at startup so the prompt stays cache-stable. */
@@ -1051,14 +1018,12 @@ fun JsonObject?.obj(key: String) = this?.get(key) as? JsonObject
 
 /** Real terminals only; tests read stdout as text. */
 object Spinner {
-    // isTerminal(), not a null check: System.console() exists even for a pipe.
-    private val enabled = System.console()?.isTerminal() == true
     private var worker: Thread? = null
 
     /** [tail] lines are painted under the spinner and redrawn each frame. */
     @Synchronized
     fun start(text: String, tail: () -> List<String> = { emptyList() }) {
-        if (!enabled || worker != null) return
+        if (!IS_TTY || worker != null) return
         val startedAt = System.currentTimeMillis()
         worker = thread(isDaemon = true) {
             var frame = 0
