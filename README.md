@@ -44,7 +44,7 @@ sequenceDiagram
         A-->>H: output items: reasoning, message, function_call*
         H->>H: append output to input
         alt function_call present
-            H->>B: run / start / output / wait / stop
+            H->>B: run / start / list / output / wait / stop
             B-->>H: result text
             H->>H: append function_call_output
         else answer only
@@ -56,89 +56,70 @@ sequenceDiagram
 # Demo
 
 ```
-> echo "briefly explain agent.kt" | ./agent.kt
+echo "briefly explain agent.kt" | ./agent.kt
 📄  Instructions: CLAUDE.md
-🧠  **Planning file inspection**
-💻  Bash: sed -n '1,220p' agent.kt && echo '---' && sed -n '220,520p' agent.kt && echo '---' && sed -n '520,920p' agent.kt
+🧠  **Planning concise file overview**
+💻  Bash: grep -n "^\(fun \|class \|object \|data class \|enum class \|private fun \|const val \)" agent.kt | sed -n '1,220p'
 📥  Output:
-   [242 lines hidden]
-               put("elapsed_ms", (System.nanoTime() - started) / 1_000_000)
-               put("body", runCatching { Json.parseToJsonElement(response.body()) }.getOrElse { JsonPrimitive(response.body()) })
+   [55 lines hidden]
+   1049:fun JsonObject.str(key: String) = this[key]?.jsonPrimitive?.contentOrNull
+   1050:fun JsonObject?.long(key: String) = this?.get(key)?.jsonPrimitive?.longOrNull ?: 0L
+   1051:fun JsonObject?.obj(key: String) = this?.get(key) as? JsonObject
+   1054:object Spinner {
+   [Exit Code: 0 after 0s]
+
+🧠  **Planning inspection around harness**
+💻  Bash: sed -n '1,230p' agent.kt && echo '---' && sed -n '189,420p' agent.kt | sed -n '1,240p' && echo '---' && sed -n '515,640p' agent.kt
+📥  Output:
+   [226 lines hidden]
+               prompted = true
            }
-           if (status == 200) return response.toTurn()
+           when (val event = events.take()) {
+               Event.EndOfInput -> break
    [Exit Code: 0 after 0s]
 
-🧠  **Inspecting code structure**
-💻  Bash: grep -nE '^(fun|class|data class|object|enum class) ' agent.kt | sed -n '1,220p'
+🧠  **Narrowing code extraction scope**
+💻  Bash: sed -n '230,430p' agent.kt && echo '---' && sed -n '430,560p' agent.kt && echo '---' && sed -n '640,820p' agent.kt && echo '---' && sed -n '820,1100p' agent.kt
 📥  Output:
-   [32 lines hidden]
-   964:fun JsonObject.str(key: String) = this[key]?.jsonPrimitive?.contentOrNull
-   965:fun JsonObject?.long(key: String) = this?.get(key)?.jsonPrimitive?.longOrNull ?: 0L
-   966:fun JsonObject?.obj(key: String) = this?.get(key) as? JsonObject
-   969:object Spinner {
-   [Exit Code: 0 after 0s]
-
-🧠  **Planning architecture inspection**
-💻  Bash: sed -n '510,760p' agent.kt
-📥  Output:
-   [247 lines hidden]
-   
-       /** Waits until the job is over (log included), [seconds] pass, or [cancelled]. */
-       fun await(seconds: Long, cancelled: () -> Boolean = { false }): Boolean {
-           val deadline = System.currentTimeMillis() + seconds * 1000
-   [Exit Code: 0 after 0s]
-
-🧠  **Inspecting core harness class**
-💻  Bash: sed -n '202,510p' agent.kt
-📥  Output:
-   [265 lines hidden]
-       """.trimIndent()
-   )
-   
-   fun main() {
-   [Exit Code: 0 after 0s]
-
-🧠  **Examining truncated code section**
-💻  Bash: sed -n '320,430p' agent.kt
-📥  Output:
-   [107 lines hidden]
-           })
+   [251 lines hidden]
+           worker?.apply { interrupt(); join() }
+           worker = null
        }
-   
-       /** One tool-less call over the dropped span as plain text (so the model summarizes rather than continues it). Null on failure. */
+   }
    [Exit Code: 0 after 0s]
 
-🧠  **Summarizing agent.kt structure**
-📊  49,930 in (34,816 cached, 69% hit) / 867 out (228 reasoning) · $0.0447 · session $0.0447
-`agent.kt` is the **entire CLI agent in one file**.  
-At a high level, it:
+🧠  **Summarizing agent architecture**
+📊  24,026 in (6,144 cached, 25% hit) / 876 out (247 reasoning) · $0.0446 · session $0.0446
+`agent.kt` is the **entire CLI harness** for this project (by design: one file, runnable with `./agent.kt`).
 
-1. **Builds the system prompt + tool schema**
-   - Tells the model how to use one tool: `bash` (`run/start/output/wait/stop`).
-   - Loads `CLAUDE.md` / `AGENTS.md` once at startup and appends them to prompt instructions.
+Briefly, it does 5 main things:
 
-2. **Runs the model loop (`BashAgentHarness`)**
-   - Stores conversation history as Responses API items.
-   - Calls `/v1/responses`, reads assistant output, executes tool calls, then sends tool results back.
-   - Repeats until the assistant returns a final text answer.
+1. **Builds the agent prompt**
+   - Defines the system prompt (how to use bash tool, background jobs, etc.).
+   - Loads `CLAUDE.md` / `AGENTS.md` from the workspace and appends them once at startup.
 
-3. **Executes shell commands safely**
-   - Foreground commands have a timeout.
-   - Background jobs are tracked by name, can be waited/stopped, and auto-reported when finished.
-   - Output is truncated for console display but preserved for model/logging.
+2. **Runs the model loop**
+   - Sends conversation history to OpenAI `/v1/responses`.
+   - Reads `output` items (assistant text, reasoning, function calls).
+   - Echoes response items back into history so tool-call chains continue correctly.
+   - Stops when the model returns a final message (no more tool calls).
 
-4. **Manages context size**
-   - If history gets too large, it trims old turns and optionally inserts a model-written summary.
+3. **Implements the `bash` tool**
+   - Supports `run`, `start`, `list`, `output`, `wait`, `stop`.
+   - Foreground commands have timeout/truncation behavior.
+   - Background jobs are tracked and can trigger follow-up turns when they finish.
 
-5. **Handles UX + runtime modes**
-   - **Interactive console mode** (JLine): `/help`, `/plan`, `/reset`, `/exit`, Ctrl+C behavior, job-finished events.
-   - **One-shot mode** (`echo "..." | ./agent.kt`): reads stdin prompt once, prints only final answer to stdout.
+4. **Provides console UX + one-shot mode**
+   - Interactive mode uses JLine (`./gradlew run` path).
+   - Non-TTY stdin becomes one-shot mode (`echo "..." | ./agent.kt`).
+   - Includes Ctrl+C handling, spinner/progress, plan-mode toggle, and session cost display.
 
-6. **Includes infra pieces**
-   - Retry/backoff for rate limits and transient API failures.
-   - JSONL logging of requests/responses/tool calls.
-   - Token/cost tracking per turn and per session.
+5. **Infra utilities**
+   - API retries/cancellation handling.
+   - History trimming + summarization when input grows too large.
+   - JSONL logging of requests/responses/tool events (`AGENT_LOG`).
+   - Token/cost accounting and helper functions.
 
-So: it’s a compact, single-file harness that turns model tool calls into real local shell execution with job control and conversation continuity.
+If you want, I can also give you a quick “map” of which function names to read first for onboarding.
 ```
 

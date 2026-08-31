@@ -2,10 +2,9 @@
 Commands:
   /help    Show this help
   /plan    Toggle plan mode (or Shift-Tab): the model explores read-only and answers with a plan
-  /reset   Clear the conversation history
+  /reset   Clear the conversation history (background jobs survive)
   /exit    Quit (or Ctrl+D)
-Ctrl+C cancels the running task (a running command is moved to a background job); at the prompt it quits.
-Background jobs survive /reset and a cancelled task; they die with the session.
+Ctrl+C stops the turn; its running command goes to background.
 Note: prompt cache retention is requested at 24h for this session.
 Piped stdin (echo "…" | ./agent.kt) runs that one prompt: answer on stdout, log on stderr, then exit.
 
@@ -19,7 +18,7 @@ Piped stdin (echo "…" | ./agent.kt) runs that one prompt: answer on stdout, lo
 
 
 ✅  The command printed hello.
-📊  2,000 in (0 cached, 0% hit) / 400 out (0 reasoning) · $0.0091 · session $0.0091
+📊  2,000 in (0 cached, 0% hit) / 400 out (0 reasoning) · $0.0091 · session $0.0091 · ctx 1,200 (0%)
 
 👤  You: /exit
 

@@ -43,7 +43,7 @@ The code should stay short and readable. If new features required signigificantl
 
 - Dependencies are declared twice — `//DEPS` in `agent.kt` for JBang and in
   `build.gradle.kts` for Gradle. Change both; `BuildConsistencyTest` enforces it.
-- `MODEL`, `REASONING_EFFORT` and the `*_USD_PER_1M` price constants move together.
+- `MODEL`, `REASONING_EFFORT`, `CONTEXT_WINDOW_TOKENS` and the `*_USD_PER_1M` price constants move together.
 - The bash tool schema is deliberately strict-shaped (`strict: true`, every property in
   `required`, the optional ones nullable). Strict is the Responses default anyway; declaring it
   keeps the logged schema honest and gives the model `null` instead of filler like `"name":""`.

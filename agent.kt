@@ -34,6 +34,7 @@ import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.Semaphore
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.TimeoutException
+import java.util.concurrent.atomic.AtomicLong
 import kotlin.concurrent.thread
 import kotlin.system.exitProcess
 
@@ -45,6 +46,7 @@ const val REASONING_EFFORT = "medium"
 const val INPUT_USD_PER_1M = 1.75
 const val CACHED_INPUT_USD_PER_1M = 0.175
 const val OUTPUT_USD_PER_1M = 14.00
+const val CONTEXT_WINDOW_TOKENS = 400_000 // moves with MODEL too
 
 const val MAX_ITERATIONS = 25
 const val TIMEOUT_SECONDS = 120L       // foreground command deadline
@@ -96,6 +98,7 @@ fun systemPrompt(workspace: File, depth: Int = AGENT_DEPTH, subAgentCommand: Str
     foreground. Slower things go in the background:
       {"command":"ls -la"}                                       foreground (default)
       {"action":"start","command":"./gradlew build","name":"build"}
+      {"action":"list"}                                          known jobs
       {"action":"output","name":"server"}                        printed so far
       {"action":"wait","name":"build","seconds":120}
       {"action":"stop","name":"server"}
@@ -147,7 +150,7 @@ val PLAN_NOTE = "\n\n[plan mode] Read-only: explore with bash (cat, grep, git lo
     "delete files, and do not start background jobs. End with a concrete step-by-step plan (files, edits, " +
     "validation) and stop; the user will approve it and ask you to execute it."
 
-// One tool, five actions, resent every turn. We mark all fields required, so optionals are nullable:
+// One tool, six actions, resent every turn. We mark all fields required, so optionals are nullable:
 // that gives the model a legal way to omit a field as null instead of inventing filler.
 val TOOLS = Json.parseToJsonElement("""[{
     "type": "function", "name": "bash", "strict": true,
@@ -155,10 +158,10 @@ val TOOLS = Json.parseToJsonElement("""[{
     "parameters": { "type": "object", "additionalProperties": false,
         "required": ["action", "command", "name", "seconds"],
         "properties": {
-            "action": { "type": "string", "enum": ["run", "start", "output", "wait", "stop"],
-                "description": "run: execute 'command' and wait. start: run it in the background. output: what a job has printed so far. wait: block until it finishes. stop: kill it." },
+            "action": { "type": "string", "enum": ["run", "start", "list", "output", "wait", "stop"],
+                "description": "run: execute 'command' and wait. start: run it in the background. list: show known jobs. output: what a job has printed so far. wait: block until it finishes. stop: kill it." },
             "command": { "type": ["string", "null"], "description": "Shell command for run and start; null otherwise." },
-            "name":    { "type": ["string", "null"], "description": "Job name for stop, output and wait; optional on start; null for run." },
+            "name":    { "type": ["string", "null"], "description": "Job name for stop, output and wait; optional on start; null for run and list." },
             "seconds": { "type": ["number", "null"], "description": "wait only: how long it may block (default $DEFAULT_WAIT_SECONDS, max $MAX_WAIT_SECONDS). Null otherwise." }
         } } }]""").jsonArray
 
@@ -222,9 +225,9 @@ class BashAgentHarness(
         }
     }
 
-    /** Cancels the running task; a foreground command survives as a background job. */
-    fun interrupt() {
-        jobs.backgroundForeground() // before the flag: run() must never see it and kill the moved job
+    /** Cancels the running task; with [moveForeground] a foreground command survives as a background job. */
+    fun interrupt(moveForeground: Boolean = true) {
+        if (moveForeground) jobs.backgroundForeground() // before the flag: run() must never see it and kill the moved job
         interrupted = true
     }
 
@@ -255,13 +258,21 @@ class BashAgentHarness(
         interrupted = false
         busy = true
         var used = Usage()
+        var last = Usage() // last call only: its input+output is what the next request would carry
         fun stopInterrupted(): Nothing? { println("\n⏹️ Interrupted. Ask again to continue."); return null }
         try {
             repeat(MAX_ITERATIONS) {
                 if (interrupted) return stopInterrupted()
                 pumpJobs(announceRunning = false)
-                trimHistory(input) { dropped ->
-                    summarize(dropped).also { s -> log?.event("trim") { put("dropped", dropped.size); put("summary", s) } }
+                // Logged after the trim, so chars_after is real; agent-log.kt reads all three keys.
+                val (itemsBefore, charsBefore) = input.size to input.sumOf { it.toString().length }
+                var summary: String? = null
+                trimHistory(input) { dropped -> summarize(dropped).also { summary = it } }
+                if (input.size < itemsBefore) log?.event("trim") {
+                    put("dropped", itemsBefore - input.size)
+                    put("chars_before", charsBefore)
+                    put("chars_after", input.sumOf { it.toString().length })
+                    put("summary", summary)
                 }
 
                 Spinner.start("Thinking")
@@ -275,6 +286,7 @@ class BashAgentHarness(
                     }
                 used += turn.usage
                 session += turn.usage
+                last = turn.usage
 
                 // Echoed back verbatim, reasoning included: that keeps the model's thinking alive.
                 turn.output.forEach { input.add(it.jsonObject) }
@@ -295,14 +307,14 @@ class BashAgentHarness(
             println("\n⏹️ Stopped after $MAX_ITERATIONS iterations. Ask again to continue.")
             return null
         } finally {
-            busy = false
             // Once per turn, not per call: the tool loop is the noisy part. A low hit % mid-session means the prefix changed.
             if (used.input > 0) println(
-                "📊  %,d in (%,d cached, %d%% hit) / %,d out (%,d reasoning) · \$%.4f · session \$%.4f".format(
+                "📊  %,d in (%,d cached, %d%% hit) / %,d out (%,d reasoning) · \$%.4f · session \$%.4f · ctx %,d (%d%%)".format(
                     Locale.ROOT, used.input, used.cached, used.cached * 100 / used.input, used.output, used.reasoning,
-                    used.cost, session.cost
+                    used.cost, session.cost, last.input + last.output, (last.input + last.output) * 100 / CONTEXT_WINDOW_TOKENS
                 )
             )
+            busy = false // last: Ctrl+C reads it, and the turn is not over until its output has printed
         }
     }
 
@@ -338,7 +350,7 @@ class BashAgentHarness(
 
     private fun runBashCall(args: JsonObject, rawArgs: String): String {
         val name = args.str("name")
-        val action = args.str("action") ?: "run" // strict schema: the enum arrives verbatim
+        val action = args.str("action")?.lowercase() ?: "run" // lowercase: a proxy behind OPENAI_BASE_URL may not enforce the strict schema
         val command = args.str("command")
         if ((action == "run" || action == "start") && command.isNullOrBlank()) {
             return "Execution Error: '$action' needs a 'command' (got: $rawArgs)"
@@ -376,6 +388,14 @@ class BashAgentHarness(
                 "Stopped background job \"${job.name}\".\n${job.report()}"
             }
 
+            "list" -> {
+                val known = jobs.all()
+                if (known.isEmpty()) "No background jobs."
+                else known.joinToString(prefix = "[background jobs]\n", separator = "\n") {
+                    "- \"${it.name}\" (${it.state.name.lowercase()}, ${it.elapsedSeconds}s): ${it.command}"
+                }
+            }
+
             "output" -> withJob(name) { job ->
                 if (job.done) job.reported = true
                 job.report()
@@ -389,7 +409,7 @@ class BashAgentHarness(
                 job.report()
             }
 
-            else -> "Execution Error: unknown action '$action' — use run, start, stop, output or wait."
+            else -> "Execution Error: unknown action '$action' — use run, start, list, stop, output or wait."
         } }.getOrElse { "Execution Error: ${it.message}" }
     }
 
@@ -487,10 +507,9 @@ fun printHelp() = println(
     Commands:
       /help    Show this help
       /plan    Toggle plan mode (or Shift-Tab): the model explores read-only and answers with a plan
-      /reset   Clear the conversation history
+      /reset   Clear the conversation history (background jobs survive)
       /exit    Quit (or Ctrl+D)
-    Ctrl+C cancels the running task (a running command is moved to a background job); at the prompt it quits.
-    Background jobs survive /reset and a cancelled task; they die with the session.
+    Ctrl+C stops the turn; its running command goes to background.
     Note: prompt cache retention is requested at 24h for this session.
     Piped stdin (echo "…" | ./agent.kt) runs that one prompt: answer on stdout, log on stderr, then exit.
     """.trimIndent()
@@ -533,7 +552,8 @@ private fun runOneShot(workspace: File, apiKey: String, log: JsonlLog?) {
 
     val harness = BashAgentHarness(workspace, apiKey, log = log, echoAnswer = false)
     Runtime.getRuntime().addShutdownHook(thread(start = false) { harness.close() })
-    Signal.handle(Signal("INT")) { harness.interrupt() }
+    // No next turn exists to deliver a backgrounded job: kill it and return the partial output.
+    Signal.handle(Signal("INT")) { harness.interrupt(moveForeground = false) }
     instructionsNotice(workspace)?.let { System.err.println(it) }
 
     val answer = harness.runTask(prompt) // the 📊 line already reports the session cost
@@ -565,10 +585,19 @@ private fun runConsole(workspace: File, apiKey: String, log: JsonlLog?) {
     // Covers every exit path.
     Runtime.getRuntime().addShutdownHook(thread(start = false) { harness.close() })
 
+    // Quit takes a second Ctrl+C: busy flips false only after a turn's last output, but a press aimed
+    // at a turn can still land just after that, and one stray keypress must not kill the session's jobs.
+    val lastIdleInt = AtomicLong(0)
+    fun quitConfirmed(): Boolean {
+        if (System.currentTimeMillis() - lastIdleInt.getAndSet(System.currentTimeMillis()) < 2000) return true
+        println("\nPress Ctrl+C again to quit")
+        return false
+    }
+
     // Via the terminal, not sun.misc: readLine saves/restores the terminal's INT handler around
     // every prompt, so a raw sun.misc registration is clobbered back to SIG_DFL after the first one.
     terminal.handle(Terminal.Signal.INT) {
-        if (harness.busy) harness.interrupt() else { farewell(); exitProcess(0) }
+        if (harness.busy) harness.interrupt() else if (quitConfirmed()) { farewell(); exitProcess(0) }
     }
 
     println("🤖  Bash Agent — Workspace: ${workspace.absolutePath}")
@@ -596,7 +625,8 @@ private fun runConsole(workspace: File, apiKey: String, log: JsonlLog?) {
                 Event.EndOfInput
             } catch (_: UserInterruptException) { // Ctrl+C caught by JLine before our handler
                 // Interrupt here, not in the main loop: it is inside resume() and would see the event too late.
-                if (harness.busy) { harness.interrupt(); Event.Interrupted } else Event.EndOfInput
+                if (harness.busy) { harness.interrupt(); Event.Interrupted }
+                else if (quitConfirmed()) Event.EndOfInput else Event.Interrupted
             }
             events.put(event)
             if (event == Event.EndOfInput) break
@@ -763,10 +793,11 @@ class BackgroundJob(
         finishedAt = System.currentTimeMillis()
     }
 
-    /** Adopts a new name and callback; refused once done (the watcher already fired the old one). */
+    /** Adopts a new name and callback; refused once done or dead (the watcher fires the old one). */
     @Synchronized
     fun handOff(newName: String, callback: (BackgroundJob) -> Unit): Boolean {
-        if (done) return false
+        // isAlive too: Ctrl+C can kill bash before its trap arms, ahead of the watcher's finish().
+        if (done || !process.isAlive) return false
         name = newName
         onFinished = callback
         return true
@@ -828,9 +859,11 @@ class JobRegistry(
         // sees, so the marker's line numbers are exact and nothing is lost however much a job prints.
         val logFile = File.createTempFile("agent-", ".log")
         // A NUL cannot cross execve, and the model occasionally emits one; stripping beats failing the call.
-        // trap '' INT: the tty's Ctrl+C signals the whole process group, and a job (descendants
-        // included, they inherit the ignore) must survive the very interrupt that backgrounds it.
-        val process = ProcessBuilder("bash", "-c", "trap '' INT; " + command.replace("\u0000", ""))
+        // trap '' INT, console only: the tty's Ctrl+C signals the whole process group, and a job (descendants
+        // included, they inherit the ignore) must survive the very interrupt that backgrounds it. Without a
+        // tty there is no group signal, and the ignore would break commands whose contract is SIGINT.
+        val prefix = if (IS_TTY) "trap '' INT; " else ""
+        val process = ProcessBuilder("bash", "-c", prefix + command.replace("\u0000", ""))
             .directory(workspace)
             .redirectInput(ProcessBuilder.Redirect.from(File("/dev/null"))) // never block on input
             .redirectErrorStream(true)
@@ -850,16 +883,19 @@ class JobRegistry(
 
     /** Runs [command] and waits, killing it at [seconds]. Not registered. */
     fun run(command: String, seconds: Long, cancelled: () -> Boolean): BackgroundJob {
-        val job = launch("foreground", command)
-        foreground = job
+        // Launched and exposed under the lock: an interrupt in the launch window must find the job.
+        val job = synchronized(this) { launch("foreground", command).also { foreground = it } }
         Spinner.start("Running") { job.tail() }
         try {
-            // foreground is null once backgroundForeground() moved the job: then it must live on.
-            if (!job.await(seconds, cancelled) && foreground != null) { job.stop(); job.await(2) }
+            if (!job.await(seconds, cancelled)) {
+                // Decided under the lock: either we kill it, or backgroundForeground() adopted it and it lives on.
+                val kill = synchronized(this) { (foreground === job).also { if (it) foreground = null } }
+                if (kill) { job.stop(); job.await(2) }
+            }
             return job
         } finally {
             Spinner.stop()
-            foreground = null
+            synchronized(this) { if (foreground === job) foreground = null }
         }
     }
 
@@ -882,6 +918,7 @@ class JobRegistry(
 
     @Synchronized fun find(name: String) = jobs[name]
     @Synchronized fun running() = jobs.values.filter { !it.done }
+    @Synchronized fun all() = jobs.values.toList()
     @Synchronized fun names() = jobs.keys.joinToString(", ").ifEmpty { "none" }
     @Synchronized fun hasUndelivered() = jobs.values.any { it.done && !it.reported }
 

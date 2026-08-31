@@ -103,6 +103,20 @@ class HarnessJobsTest : FunSpec({
         }
     }
 
+    test("list shows known background jobs") {
+        MockOpenAi().use { mock ->
+            mock.script(
+                turn(reasoning(), bash(action = "start", command = "sleep 30", name = "server")),
+                turn(reasoning(), bash(action = "list", callId = "call_2")),
+                turn(answer("listed"))
+            )
+            BashAgentHarness(workspace, "test-key", mock.baseUrl).use { it.runTask("start it and list jobs") }
+
+            mock.toolResult(2) shouldStartWith "[background jobs]\n- \"server\" (running, "
+            mock.toolResult(2) shouldContain "): sleep 30"
+        }
+    }
+
     test("the model can stop a job it started") {
         val marker = "kotest-harness-stop-marker"
         MockOpenAi().use { mock ->

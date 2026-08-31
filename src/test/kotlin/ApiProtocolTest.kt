@@ -14,6 +14,7 @@ import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
 import java.net.InetSocketAddress
 import java.net.http.HttpClient
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.concurrent.thread
 
@@ -56,7 +57,7 @@ class ApiProtocolTest : FunSpec({
             }
         }
 
-        test("the bash tool multiplexes its five actions onto one enum") {
+        test("the bash tool multiplexes its six actions onto one enum") {
             MockOpenAi().use { mock ->
                 mock.script(turn(answer("ok")))
                 mock.call()
@@ -69,7 +70,7 @@ class ApiProtocolTest : FunSpec({
 
                 properties["action"]!!.jsonObject["enum"]!!.jsonArray
                     .map { it.jsonPrimitive.content } shouldBe
-                    listOf("run", "start", "output", "wait", "stop")
+                    listOf("run", "start", "list", "output", "wait", "stop")
             }
         }
 
@@ -289,9 +290,11 @@ class ApiProtocolTest : FunSpec({
         }
 
         test("cancelling an in-flight request abandons it instead of awaiting the response") {
-            // The server never answers: only the cancel can end the call in time.
+            // The server never answers: only the cancel can end the call in time. A latch, not a sleep:
+            // server.stop() joins the dispatcher thread, so a sleeping handler would stall the suite.
+            val hang = CountDownLatch(1)
             val server = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
-            server.createContext("/v1/responses") { Thread.sleep(60_000) }
+            server.createContext("/v1/responses") { hang.await() }
             server.start()
             try {
                 val cancelled = AtomicBoolean(false)
@@ -304,6 +307,7 @@ class ApiProtocolTest : FunSpec({
 
                 (System.currentTimeMillis() - started) shouldBeLessThan 5_000L
             } finally {
+                hang.countDown()
                 server.stop(0)
             }
         }
