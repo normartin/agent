@@ -56,6 +56,8 @@ dependencies {
 
 kotlin {
     compilerOptions {
+        // Fail the build on any Kotlin warning in main and test compilations.
+        allWarningsAsErrors = true
         // The local JDK is newer than any target Kotlin 2.4 accepts. This sets
         // the bytecode version only, so sun.misc.Signal stays reachable.
         jvmTarget = JvmTarget.JVM_21

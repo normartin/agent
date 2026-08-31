@@ -145,8 +145,9 @@ class TrimHistoryTest : FunSpec({
         var seen: List<JsonObject>? = null
         trimHistory(input) { dropped -> seen = dropped; "the gist" }
 
-        seen!!.first() shouldBe roleMsg("user", "task 0")          // system prompt not offered up
-        seen!!.last().str("role") shouldBe "assistant"             // stops right before the surviving user turn
+        val dropped = checkNotNull(seen)
+        dropped.first() shouldBe roleMsg("user", "task 0")         // system prompt not offered up
+        dropped.last().str("role") shouldBe "assistant"            // stops right before the surviving user turn
         input[1] shouldBe roleMsg("user", "[summary of earlier conversation]\nthe gist")
         input[2].str("role") shouldBe "user"
         input.first().str("content") shouldBe "sys"
