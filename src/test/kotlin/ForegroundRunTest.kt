@@ -110,6 +110,12 @@ class ForegroundRunTest : FunSpec({
         jobs.names() shouldBe "none"
     }
 
+    test("a NUL in the command is stripped instead of failing the call") {
+        // The model occasionally emits a literal NUL; execve would reject it wholesale.
+        JobRegistry(workspace).run("echo a\u0000b", 30) { false }
+            .report() shouldStartWith "ab\n"
+    }
+
     test("a failure to launch is reported rather than thrown") {
         // Answered by the harness, which turns it into an error string: an
         // unanswered function_call is a 400 on the very next request.

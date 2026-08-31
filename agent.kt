@@ -836,7 +836,8 @@ class JobRegistry(
         // stdout and stderr merged like a terminal, straight to a file: the log is exactly what the model
         // sees, so the marker's line numbers are exact and nothing is lost however much a job prints.
         val logFile = File.createTempFile("agent-", ".log")
-        val process = ProcessBuilder("bash", "-c", command)
+        // A NUL cannot cross execve, and the model occasionally emits one; stripping beats failing the call.
+        val process = ProcessBuilder("bash", "-c", command.replace("\u0000", ""))
             .directory(workspace)
             .redirectInput(ProcessBuilder.Redirect.from(File("/dev/null"))) // never block on input
             .redirectErrorStream(true)

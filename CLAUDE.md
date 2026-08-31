@@ -53,6 +53,9 @@ The code should stay short and readable. If new features required signigificantl
   default of true, so the bare reasoning ids stay resolvable server-side.
   Setting `store` to false silently breaks it unless you also request
   `include: ["reasoning.encrypted_content"]`.
+- Expect a one-off `cached_tokens` dip on the first request after an assistant turn completes: the API
+  drops that turn's reasoning items server-side, shifting the resolved token stream even though the
+  logged prefix is unchanged (billed input shrinks too). Not a harness bug; the cache re-warms next request.
 - Past `MAX_HISTORY_CHARS` the oldest turns are dropped and replaced by a model-written summary
   (`trimHistory` + `summarize`): one tool-less call over the dropped span, inserted as a *user* item at
   index 1. Never item 0, so the cached prefix survives the trim; on failure the plain trim still happens.
