@@ -84,12 +84,13 @@ fun answer(text: String) = buildJsonObject {
 fun bash(
     action: String? = null,
     command: String? = null,
+    stdin: String? = null,
     name: String? = null,
     seconds: Number? = null,
     callId: String = "call_1"
 ) = bashRaw(
     buildJsonObject {
-        put("action", action); put("command", command); put("name", name); put("seconds", seconds)
+        put("action", action); put("command", command); put("stdin", stdin); put("name", name); put("seconds", seconds)
     }.toString(),
     callId
 )

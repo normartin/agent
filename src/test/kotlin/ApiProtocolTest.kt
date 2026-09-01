@@ -66,7 +66,7 @@ class ApiProtocolTest : FunSpec({
 
                 val parameters = bash["parameters"]!!.jsonObject
                 val properties = parameters["properties"]!!.jsonObject
-                properties.keys shouldBe setOf("action", "command", "name", "seconds")
+                properties.keys shouldBe setOf("action", "command", "stdin", "name", "seconds")
 
                 properties["action"]!!.jsonObject["enum"]!!.jsonArray
                     .map { it.jsonPrimitive.content } shouldBe
@@ -89,12 +89,13 @@ class ApiProtocolTest : FunSpec({
                 val parameters = bash["parameters"]!!.jsonObject
                 parameters["additionalProperties"]!!.jsonPrimitive.content shouldBe "false"
                 parameters["required"]!!.jsonArray.map { it.jsonPrimitive.content } shouldBe
-                    listOf("action", "command", "name", "seconds")
+                    listOf("action", "command", "stdin", "name", "seconds")
 
                 val properties = parameters["properties"]!!.jsonObject
                 fun types(name: String) = properties[name]!!.jsonObject["type"]!!.jsonArray.map { it.jsonPrimitive.content }
                 properties["action"]!!.jsonObject["type"]!!.jsonPrimitive.content shouldBe "string"
                 types("command") shouldBe listOf("string", "null")
+                types("stdin") shouldBe listOf("string", "null")
                 types("name") shouldBe listOf("string", "null")
                 types("seconds") shouldBe listOf("number", "null")
             }

@@ -89,7 +89,8 @@ val IS_TTY = System.console()?.isTerminal() == true
 /** Item 0 of every request. Stable by design: the prompt cache keys on it. */
 fun systemPrompt(workspace: File, depth: Int = AGENT_DEPTH, subAgentCommand: String? = selfCommand()): String = """
     You are a coding agent with a local bash shell via the "bash" tool. Working directory: ${workspace.absolutePath}
-    Commands already run there; no need to cd into it. ${availableTools()} There is no apply_patch: edit with sed, python3 or a heredoc.
+    Commands already run there; no need to cd into it. ${availableTools()} There is no apply_patch: edit with sed or
+    python3 — put multi-line scripts and file content in the "stdin" field ("python3 -", "cat > file"), not in a heredoc.
     You are in an ongoing console conversation; keep earlier turns in mind. When the request is done, answer and stop.
 
     Chain steps with && or a small script (after a heredoc, start the next command on its own
@@ -157,11 +158,12 @@ val TOOLS = Json.parseToJsonElement("""[{
     "type": "function", "name": "bash", "strict": true,
     "description": "Run a shell command in the workspace (killed after ${TIMEOUT_SECONDS}s), or manage a background job that outlives the turn and is referred to by name.",
     "parameters": { "type": "object", "additionalProperties": false,
-        "required": ["action", "command", "name", "seconds"],
+        "required": ["action", "command", "stdin", "name", "seconds"],
         "properties": {
             "action": { "type": "string", "enum": ["run", "start", "list", "output", "wait", "stop"],
                 "description": "run: execute 'command' and wait. start: run it in the background. list: show known jobs. output: what a job has printed so far. wait: block until it finishes. stop: kill it." },
             "command": { "type": ["string", "null"], "description": "Shell command for run and start; null otherwise." },
+            "stdin":   { "type": ["string", "null"], "description": "run and start: text fed to the command's standard input — put multi-line scripts here (command \"python3 -\" or \"bash -s\") or exact file content (command \"cat > path\"). Null otherwise." },
             "name":    { "type": ["string", "null"], "description": "Job name for stop, output and wait; optional on start; null for run and list." },
             "seconds": { "type": ["number", "null"], "description": "wait only: how long it may block (default $DEFAULT_WAIT_SECONDS, max $MAX_WAIT_SECONDS). Null otherwise." }
         } } }]""").jsonArray
@@ -357,14 +359,15 @@ class BashAgentHarness(
         val name = args.str("name")
         val action = args.str("action")?.lowercase() ?: "run" // lowercase: a proxy behind OPENAI_BASE_URL may not enforce the strict schema
         val command = args.str("command")
+        val stdin = args.str("stdin")
         if ((action == "run" || action == "start") && command.isNullOrBlank()) {
             return "Execution Error: '$action' needs a 'command' (got: $rawArgs)"
         }
 
         return runCatching { when (action) {
             "run" -> {
-                println("💻  Bash: $command")
-                val job = jobs.run(command!!, timeoutSeconds) { interrupted }
+                println("💻  Bash: $command" + (stdin?.let { " ⇐ stdin: ${it.length} chars" } ?: ""))
+                val job = jobs.run(command!!, timeoutSeconds, stdin) { interrupted }
                 if (job.name != "foreground") { // renamed only when Ctrl+C moved it to the background
                     println("📦  Moved to background job \"${job.name}\"")
                     "Interrupted by the user — the command continues as background job \"${job.name}\". " +
@@ -381,8 +384,8 @@ class BashAgentHarness(
             }
 
             "start" -> {
-                val job = jobs.start(command!!, name)
-                println("🚀  Started background job \"${job.name}\": $command")
+                val job = jobs.start(command!!, name, stdin)
+                println("🚀  Started background job \"${job.name}\": $command" + (stdin?.let { " ⇐ stdin: ${it.length} chars" } ?: ""))
                 "Started background job \"${job.name}\". Its output will be delivered to you when it finishes."
             }
 
@@ -869,10 +872,12 @@ class JobRegistry(
     private var counter = 0
     @Volatile private var foreground: BackgroundJob? = null
 
-    private fun launch(name: String, command: String, onFinished: (BackgroundJob) -> Unit = {}): BackgroundJob {
+    private fun launch(name: String, command: String, stdin: String? = null, onFinished: (BackgroundJob) -> Unit = {}): BackgroundJob {
         // stdout and stderr merged like a terminal, straight to a file: the log is exactly what the model
         // sees, so the marker's line numbers are exact and nothing is lost however much a job prints.
         val logFile = File.createTempFile("agent-", ".log")
+        // A temp file, not a pipe: no writer thread, no deadlock, and null still means EOF at once.
+        val stdinFile = stdin?.let { File.createTempFile("agent-", ".stdin").apply { writeText(it) } }
         // A NUL cannot cross execve, and the model occasionally emits one; stripping beats failing the call.
         // trap '' INT, console only: the tty's Ctrl+C signals the whole process group, and a job (descendants
         // included, they inherit the ignore) must survive the very interrupt that backgrounds it. Without a
@@ -880,7 +885,7 @@ class JobRegistry(
         val prefix = if (IS_TTY) "trap '' INT; " else ""
         val process = ProcessBuilder("bash", "-c", prefix + command.replace("\u0000", ""))
             .directory(workspace)
-            .redirectInput(ProcessBuilder.Redirect.from(File("/dev/null"))) // never block on input
+            .redirectInput(ProcessBuilder.Redirect.from(stdinFile ?: File("/dev/null"))) // never block on input
             .redirectErrorStream(true)
             .redirectOutput(logFile)
             .apply {
@@ -892,14 +897,14 @@ class JobRegistry(
     }
 
     /** Throws only if [command] will not launch. */
-    fun start(command: String, requested: String? = null): BackgroundJob = synchronized(this) {
-        launch(nameFor(requested), command, onFinished).also { jobs[it.name] = it }
+    fun start(command: String, requested: String? = null, stdin: String? = null): BackgroundJob = synchronized(this) {
+        launch(nameFor(requested), command, stdin, onFinished).also { jobs[it.name] = it }
     }
 
     /** Runs [command] and waits, killing it at [seconds]. Not registered. */
-    fun run(command: String, seconds: Long, cancelled: () -> Boolean): BackgroundJob {
+    fun run(command: String, seconds: Long, stdin: String? = null, cancelled: () -> Boolean): BackgroundJob {
         // Launched and exposed under the lock: an interrupt in the launch window must find the job.
-        val job = synchronized(this) { launch("foreground", command).also { foreground = it } }
+        val job = synchronized(this) { launch("foreground", command, stdin).also { foreground = it } }
         Spinner.start("Running") { job.tail() }
         try {
             if (!job.await(seconds, cancelled)) {

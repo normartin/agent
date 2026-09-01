@@ -44,6 +44,12 @@ class BackgroundJobsTest : FunSpec({
         jobs.killAll()
     }
 
+    test("stdin also feeds a background job") {
+        val job = JobRegistry(workspace).start("cat -", stdin = "fed in the background\n")
+        job.finish()
+        job.report() shouldStartWith "fed in the background\n"
+    }
+
     test("jobs run in the workspace") {
         val jobs = JobRegistry(workspace)
         val job = jobs.start("pwd")

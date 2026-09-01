@@ -147,6 +147,37 @@ class ForegroundRunTest : FunSpec({
             .report() shouldStartWith "ab\n"
     }
 
+    test("stdin content reaches the command, and && chains on the same line") {
+        // The heredoc replacement: script body out-of-band, command a plain one-liner.
+        JobRegistry(workspace).run("cat - && echo chained", 30, stdin = "one\ntwo\n") { false }
+            .report() shouldStartWith "one\ntwo\nchained\n"
+    }
+
+    test("stdin writes a file byte-exact, no heredoc escaping") {
+        val content = "quotes \" and ' and \\backslash\nand \$HOME left alone\n"
+        JobRegistry(workspace).run("cat > exact.txt", 30, stdin = content) { false }
+            .report() shouldContain "[Exit Code: 0"
+        java.io.File(workspace, "exact.txt").readText() shouldBe content
+    }
+
+    test("without stdin a reading command sees EOF at once instead of hanging") {
+        val job = JobRegistry(workspace).run("cat -", 30) { false }
+        job.state shouldBe JobState.EXITED
+        job.report() shouldStartWith "[Exit Code: 0"
+    }
+
+    test("a stdin field in the tool call reaches the process") {
+        MockOpenAi().use { mock ->
+            mock.script(
+                turn(reasoning(), bash(command = "cat > greeting.txt", stdin = "hello\nworld\n")),
+                turn(answer("written"))
+            )
+            BashAgentHarness(workspace, "test-key", mock.baseUrl).use { it.runTask("write it") shouldBe "written" }
+
+            java.io.File(workspace, "greeting.txt").readText() shouldBe "hello\nworld\n"
+        }
+    }
+
     test("a failure to launch is reported rather than thrown") {
         // Answered by the harness, which turns it into an error string: an
         // unanswered function_call is a 400 on the very next request.
