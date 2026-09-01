@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 
+# set OpenAPI key in fish shell using: set -x OPENAI_API_KEY "..."
+
 docker run -it --rm \
   -e LANG=C.UTF-8 -e LC_ALL=C.UTF-8 \
   -v nix-store:/nix \

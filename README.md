@@ -24,6 +24,13 @@ export OPENAI_API_KEY=...
 echo "fix the tests" | ./agent.kt   # one-shot: answer on stdout
 ```
 
+## Sandbox
+
+`./sandbox.sh` starts a Docker container (nixos/nix) with JBang, JDK, and common tools,
+mounting the current directory at `/project` and dropping you into a fish shell.
+Inside, set the key (`set -x OPENAI_API_KEY ...`) and run `./agent.kt` as usual.
+Nix and JBang caches persist in named volumes across runs.
+
 ## How it works
 
 ### The agent loop
