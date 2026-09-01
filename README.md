@@ -2,7 +2,7 @@
 
 An experimental small (1k lines), [single-file](./agent.kt) coding agent written in Kotlin.
 
-It has only one tool **bash**. No guardrails! Run it in a sandbox. OpenAI API only.
+It has only one tool **bash**. No guardrails! Run it in a [sandbox](#sandbox). OpenAI API only.
 
 ## Features
 
@@ -15,7 +15,7 @@ It has only one tool **bash**. No guardrails! Run it in a sandbox. OpenAI API on
 
 ## Run
 
-Requires [JBang](https://www.jbang.dev/)
+Requires [JBang](https://www.jbang.dev/) (SDKMan: ```sdk install jbang```)
 
 ```sh
 export OPENAI_API_KEY=...
@@ -31,102 +31,81 @@ mounting the current directory at `/project` and dropping you into a fish shell.
 Inside, set the key (`set -x OPENAI_API_KEY ...`) and run `./agent.kt` as usual.
 Nix and JBang caches persist in named volumes across runs.
 
-## How it works
+Please note: Docker is not a secure sandbox. Prefer using real VM for serious work. 
 
-### The agent loop
+## Bash tool
 
+| Action   | Parameters                   | Does                                                    |
+|----------|------------------------------|---------------------------------------------------------|
+| `run`    | `command`, `stdin`?          | Execute a command in the foreground (killed after 120s) |
+| `start`  | `command`, `stdin`?, `name`? | Run a command as a named background job                 |
+| `list`   | —                            | Show known jobs                                         |
+| `output` | `name`                       | What a job has printed so far                           |
+| `wait`   | `name`, `seconds`?           | Block until a job finishes (default 60s, max 600s)      |
+| `stop`   | `name`                       | Kill a job                                              |
 
-```mermaid
-sequenceDiagram
-    participant U as User
-    participant H as Harness (runLoop)
-    participant A as OpenAI /v1/responses
-    participant B as bash (JobRegistry)
+| Parameter | Meaning                                                                                    |
+|-----------|--------------------------------------------------------------------------------------------|
+| `command` | Shell command to execute                                                                   |
+| `stdin`   | Text fed to the command's standard input: multi-line scripts (`bash -s`) or exact file content (`cat > path`) |
+| `name`    | Job identifier; picked automatically if omitted on `start`                                 |
+| `seconds` | How long `wait` may block                                                                  |
 
-    U->>H: prompt
-    H->>H: pumpJobs: append finished-job notices
-    loop until no function_call (max MAX_ITERATIONS)
-        H->>H: trimHistory (+ summarize) if over budget
-        H->>A: POST input (system + history + tools)
-        A-->>H: output items: reasoning, message, function_call*
-        H->>H: append output to input
-        alt function_call present
-            H->>B: run / start / list / output / wait / stop
-            B-->>H: result text
-            H->>H: append function_call_output
-        else answer only
-            H-->>U: ✅ answer + 📊 cost
-        end
-    end
+```json
+{"action":"run","command":"cat > hello.py","stdin":"print('hi')","name":null,"seconds":null}
+{"action":"start","command":"./gradlew build","name":"build","stdin":null,"seconds":null}
+{"action":"wait","name":"build","seconds":120,"command":null,"stdin":null}
 ```
+
+- Output over 12k chars is truncated in the middle; a marker names a file holding the rest.
+- A finished background job delivers its output to the model, even while the user
+  is idle at the prompt — sub-agents report back the same way.
 
 # Demo
 
 ```
 echo "briefly explain agent.kt" | ./agent.kt
+[jbang] Building jar for agent.kt...
 📄  Instructions: CLAUDE.md
-🧠  **Planning concise file overview**
-💻  Bash: grep -n "^\(fun \|class \|object \|data class \|enum class \|private fun \|const val \)" agent.kt | sed -n '1,220p'
-📥  Output:
-   [55 lines hidden]
-   1049:fun JsonObject.str(key: String) = this[key]?.jsonPrimitive?.contentOrNull
-   1050:fun JsonObject?.long(key: String) = this?.get(key)?.jsonPrimitive?.longOrNull ?: 0L
-   1051:fun JsonObject?.obj(key: String) = this?.get(key) as? JsonObject
-   1054:object Spinner {
-   [Exit Code: 0 after 0s]
+🧠  **Preparing to inspect file**
+💻  Bash: sed -n '1,260p' agent.kt
+📥  [Exit Code: 0 after 0s] (260 lines)
 
-🧠  **Planning inspection around harness**
-💻  Bash: sed -n '1,230p' agent.kt && echo '---' && sed -n '189,420p' agent.kt | sed -n '1,240p' && echo '---' && sed -n '515,640p' agent.kt
-📥  Output:
-   [226 lines hidden]
-               prompted = true
-           }
-           when (val event = events.take()) {
-               Event.EndOfInput -> break
-   [Exit Code: 0 after 0s]
+🧠  **Inspecting code structure**
+💻  Bash: grep -n "^// ----------\|^class \|^fun main\|^data class\|^object\|^enum class\|^val TOOLS\|^fun systemPrompt\|^class BashAgentHarness\|^class JobRegistry\|^class Spinner" agent.kt | sed -n '1,220p'
+📥  [Exit Code: 0 after 0s] (16 lines)
 
-🧠  **Narrowing code extraction scope**
-💻  Bash: sed -n '230,430p' agent.kt && echo '---' && sed -n '430,560p' agent.kt && echo '---' && sed -n '640,820p' agent.kt && echo '---' && sed -n '820,1100p' agent.kt
-📥  Output:
-   [251 lines hidden]
-           worker?.apply { interrupt(); join() }
-           worker = null
-       }
-   }
-   [Exit Code: 0 after 0s]
+📊  23,953 in (14,080 cached, 58% hit) / 622 out (123 reasoning) · $0.0284 · session $0.0284 · ctx 9,643 (2%)
+`agent.kt` is the **entire CLI agent implementation** in one Kotlin file.
 
-🧠  **Summarizing agent architecture**
-📊  24,026 in (6,144 cached, 25% hit) / 876 out (247 reasoning) · $0.0446 · session $0.0446
-`agent.kt` is the **entire CLI harness** for this project (by design: one file, runnable with `./agent.kt`).
+At a high level, it does 5 things:
 
-Briefly, it does 5 main things:
+1. **Defines the model setup and tools**  
+   - Chooses model/pricing constants  
+   - Builds a stable system prompt (plus `CLAUDE.md`/`AGENTS.md` instructions)  
+   - Declares tool schemas (`bash` + `web_search`) for Responses API
 
-1. **Builds the agent prompt**
-   - Defines the system prompt (how to use bash tool, background jobs, etc.).
-   - Loads `CLAUDE.md` / `AGENTS.md` from the workspace and appends them once at startup.
+2. **Runs the agent loop (`BashAgentHarness`)**  
+   - Sends conversation + tool results to `/v1/responses`  
+   - Executes requested tools  
+   - Appends outputs back into conversation until assistant gives final answer  
+   - Tracks token usage/cost and trims/summarizes history when it gets too large
 
-2. **Runs the model loop**
-   - Sends conversation history to OpenAI `/v1/responses`.
-   - Reads `output` items (assistant text, reasoning, function calls).
-   - Echoes response items back into history so tool-call chains continue correctly.
-   - Stops when the model returns a final message (no more tool calls).
+3. **Provides entrypoints**  
+   - `main()` supports:
+     - **Interactive TTY mode** (prompt loop, Ctrl+C handling, spinner)
+     - **One-shot mode** (`echo "task" | ./agent.kt`)
 
-3. **Implements the `bash` tool**
-   - Supports `run`, `start`, `list`, `output`, `wait`, `stop`.
-   - Foreground commands have timeout/truncation behavior.
-   - Background jobs are tracked and can trigger follow-up turns when they finish.
+4. **Implements shell job management**  
+   - Foreground command execution with timeout/truncation  
+   - Background jobs (`start/list/output/wait/stop`) via `JobRegistry` and `BackgroundJob`  
+   - Job-finished notifications that can trigger a new model turn
 
-4. **Provides console UX + one-shot mode**
-   - Interactive mode uses JLine (`./gradlew run` path).
-   - Non-TTY stdin becomes one-shot mode (`echo "..." | ./agent.kt`).
-   - Includes Ctrl+C handling, spinner/progress, plan-mode toggle, and session cost display.
+5. **Includes infra utilities**  
+   - HTTP + retry logic for API calls  
+   - JSONL event logging (`JsonlLog`)  
+   - terminal spinner/render helpers and misc utility functions
 
-5. **Infra utilities**
-   - API retries/cancellation handling.
-   - History trimming + summarization when input grows too large.
-   - JSONL logging of requests/responses/tool events (`AGENT_LOG`).
-   - Token/cost accounting and helper functions.
-
-If you want, I can also give you a quick “map” of which function names to read first for onboarding.
+So: **prompting + tool-calling + command execution + job orchestration + console UX** all live in this one file.
 ```
 
