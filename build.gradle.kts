@@ -66,6 +66,9 @@ kotlin {
 }
 
 java {
+    toolchain {
+        languageVersion.set(JavaLanguageVersion.of(25))
+    }
     sourceCompatibility = JavaVersion.VERSION_22
     targetCompatibility = JavaVersion.VERSION_22
 }
