@@ -15,15 +15,13 @@ class ConsoleTest : FunSpec({
 
     test("a job finishing while the user is idle at the prompt starts a turn by itself") {
         MockOpenAi().use { mock ->
-            mock.script(
-                turn(reasoning(), bash(action = "start", command = "sleep 1; echo done")),
-                turn(answer("started")),
-                turn(answer("saw it"))
-            )
             val out = console(workspace, mock) {
-                line("run it")
+                user("run it")
+                model(reasoning(), bash(action = "start", command = "sleep 1; echo done"))
+                model(answer("started"))
+                model(answer("saw it"))
                 awaitRequests(3) // nothing typed meanwhile: the third request comes from the finished job
-                line("/exit")
+                user("/exit")
             }
             out shouldContain "saw it"
             mock.requests.size shouldBe 3
@@ -33,19 +31,17 @@ class ConsoleTest : FunSpec({
 
     test("Ctrl+C during a foreground command backgrounds it instead of quitting") {
         MockOpenAi().use { mock ->
-            mock.script(
-                // The marker is split so the echoed command line cannot satisfy awaitScreen: only real output can.
-                turn(reasoning(), bash(command = "echo trap''-armed; sleep 2; echo survived")),
-                turn(answer("saw it"))
-            )
             val out = console(workspace, mock) {
-                line("run it")
+                user("run it")
+                // The marker is split so the echoed command line cannot satisfy awaitScreen: only real output can.
+                model(reasoning(), bash(command = "echo trap''-armed; sleep 2; echo survived"))
                 // Via the spinner's live tail. Not "Running": SIGINT before bash runs `trap '' INT` kills the job.
                 awaitScreen("trap-armed")
                 interrupt()
                 awaitScreen("Moved to background job")
+                model(answer("saw it"))
                 awaitRequests(2) // the moved job finishing starts a turn on its own
-                line("/exit")
+                user("/exit")
             }
             out shouldContain "Interrupted"
             out shouldContain "saw it"

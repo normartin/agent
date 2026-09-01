@@ -10,6 +10,7 @@ import com.jediterm.terminal.model.StyleState
 import com.jediterm.terminal.model.TerminalSelection
 import com.jediterm.terminal.model.TerminalTextBuffer
 import com.pty4j.PtyProcessBuilder
+import kotlinx.serialization.json.JsonObject
 import java.io.File
 import java.io.OutputStream
 import java.util.concurrent.TimeUnit
@@ -22,22 +23,33 @@ class Session(
     private val buffer: TerminalTextBuffer, private val mock: MockOpenAi,
 ) {
     private var typed = 0
+    private var pending: String? = null
     private fun await(what: String, ready: () -> Boolean) {
         val deadline = System.currentTimeMillis() + 15_000
         while (!ready() && System.currentTimeMillis() < deadline) Thread.sleep(50)
         check(ready()) { "timed out waiting for $what:\n${snapshot(buffer)}" }
     }
+    /** Typed lazily: a line goes out at the next user()/await*()/interrupt() or end of block, so the
+     *  model(...) lines after it are scripted before the request they answer — no race to lose. */
+    fun user(text: String) {
+        flush()
+        pending = text
+    }
+    /** Scripts the model's next reply, so a session reads as a transcript: user(...), model(...), model(...). */
+    fun model(vararg items: JsonObject) { mock.script(turn(*items)) }
+    fun awaitRequests(n: Int) { flush(); await("$n requests") { mock.requests.size >= n } }
+    fun awaitScreen(text: String) { flush(); await("\"$text\" on screen") { snapshot(buffer).contains(text) } }
+    /** Ctrl+C as a tty delivers it: in cooked mode (task running) it becomes SIGINT to the agent's process group. */
+    fun interrupt() { flush(); stdin.write(3); stdin.flush() }
     // Typing before readLine is active is lost: the raw-mode switch flushes the tty's input queue.
     // JLine enters application-cursor mode at every readLine; the prompt text itself is unreliable on a pty.
-    fun line(text: String) {
+    internal fun flush() {
+        val text = pending ?: return
+        pending = null
         await("prompt") { prompts.get() > typed }
         typed++
         stdin.write("$text\n".toByteArray()); stdin.flush()
     }
-    fun awaitRequests(n: Int) = await("$n requests") { mock.requests.size >= n }
-    fun awaitScreen(text: String) = await("\"$text\" on screen") { snapshot(buffer).contains(text) }
-    /** Ctrl+C as a tty delivers it: in cooked mode (task running) it becomes SIGINT to the agent's process group. */
-    fun interrupt() { stdin.write(3); stdin.flush() }
 }
 
 private const val COLS = 120
@@ -75,7 +87,9 @@ fun console(workspace: File, mock: MockOpenAi, type: Session.() -> Unit): String
     // Drain on a thread so the pty never blocks; ends when the pty closes (EOF).
     val drain = thread { while (emulator.hasNext()) emulator.next() }
     try {
-        Session(process.outputStream, prompts, buffer, mock).type()
+        val session = Session(process.outputStream, prompts, buffer, mock)
+        session.type()
+        session.flush() // the trailing user line (usually /exit) is still pending
         if (!process.waitFor(30, TimeUnit.SECONDS)) error("console did not exit:\n${snapshot(buffer)}")
     } finally { process.destroyForcibly() }
     drain.join()
