@@ -61,18 +61,20 @@ kotlin {
         allWarningsAsErrors = true
         // The local JDK is newer than any target Kotlin 2.4 accepts. This sets
         // the bytecode version only, so sun.misc.Signal stays reachable.
-        jvmTarget = JvmTarget.JVM_21
+        jvmTarget = JvmTarget.JVM_22
     }
 }
 
 java {
-    sourceCompatibility = JavaVersion.VERSION_21
-    targetCompatibility = JavaVersion.VERSION_21
+    sourceCompatibility = JavaVersion.VERSION_22
+    targetCompatibility = JavaVersion.VERSION_22
 }
 
 tasks.test {
     // Required: without it Gradle finds zero Kotest tests and "passes".
     useJUnitPlatform()
+    // pty4j/jna hit restricted native methods on newer JDKs; enable native access for tests.
+    jvmArgs("--enable-native-access=ALL-UNNAMED")
     // IntelliJ sets idea.active on every Gradle call it launches; hand it to the test JVM
     // so approval mismatches only open a diff tool for a human in the IDE.
     systemProperty("idea.active", providers.systemProperty("idea.active").getOrElse("false"))
