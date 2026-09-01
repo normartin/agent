@@ -25,9 +25,10 @@ The code should stay short and readable. If new features required signigificantl
   It is experimental: remove it if it becomes a maintenance burden.
 - `./gradlew run` — start the console. Needs `OPENAI_API_KEY`.
 - `OPENAI_BASE_URL` redirects the API to a proxy or local server.
-- `AGENT_LOG` names a JSON-lines logfile (default `agent-YYYYMMDD-HHMMSS.jsonl`, local time, per session in the cwd; set it empty to
+- `AGENT_LOG` names a JSON-lines logfile (default `.agent/agent-YYYYMMDD-HHMMSS.jsonl`, local time, per session in the
+  cwd — under `.agent/` so the model's own greps don't match the log of its conversation; set it empty to
   disable). Every API request/response, tool call, retry and job notice lands there, so it grows
-  fast and is safe to delete. `jq -c .type agent-*.jsonl` shows the event flow.
+  fast and is safe to delete. `jq -c .type .agent/agent-*.jsonl` shows the event flow.
 - `CLAUDE.md` and `AGENTS.md` in the cwd, when present, are read once at startup and appended to the
   system prompt (each capped at `MAX_INSTRUCTIONS_CHARS`, head and tail kept). They go in item 0 on
   purpose: read once, they are stable turn to turn, so the prompt cache keeps covering them. The

@@ -92,11 +92,12 @@ fun systemPrompt(workspace: File, depth: Int = AGENT_DEPTH, subAgentCommand: Str
     Commands already run there; no need to cd into it. ${availableTools()} There is no apply_patch: edit with sed, python3 or a heredoc.
     You are in an ongoing console conversation; keep earlier turns in mind. When the request is done, answer and stop.
 
-    Chain steps with && or a small script. A foreground command is killed after ${TIMEOUT_SECONDS}s and output over
+    Chain steps with && or a small script (after a heredoc, start the next command on its own
+    line, never with &&). A foreground command is killed after ${TIMEOUT_SECONDS}s and output over
     $MAX_OUTPUT_CHARS chars is truncated in the middle (so read at most ~300 lines per call); the marker names a
     file holding the full output, so sed -n or grep -n that instead of re-running. Never start a server in the
     foreground. Slower things go in the background:
-      {"command":"ls -la"}                                       foreground (default)
+      {"action":"run","command":"ls -la"}                        foreground
       {"action":"start","command":"./gradlew build","name":"build"}
       {"action":"list"}                                          known jobs
       {"action":"output","name":"server"}                        printed so far
@@ -547,8 +548,9 @@ fun main() {
 }
 
 /** AGENT_LOG: unset -> one file per session (local time), blank -> off, otherwise the given path. */
+// Under .agent/ so the model's own greps over the workspace don't match the log of this conversation.
 fun resolveLogPath(env: String?, now: Instant = Instant.now(), zone: ZoneId = ZoneId.systemDefault()): String? = when {
-    env == null -> "agent-${ofPattern("yyyyMMdd-HHmmss").withZone(zone).format(now)}.jsonl"
+    env == null -> ".agent/agent-${ofPattern("yyyyMMdd-HHmmss").withZone(zone).format(now)}.jsonl"
     env.isBlank() -> null
     else -> env
 }
