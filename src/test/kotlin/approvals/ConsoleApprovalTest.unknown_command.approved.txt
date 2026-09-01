@@ -8,7 +8,7 @@ Ctrl+C stops the turn; its running command goes to background.
 Note: prompt cache retention is requested at 24h for this session.
 Piped stdin (echo "…" | ./agent.kt) runs that one prompt: answer on stdout, log on stderr, then exit.
 
-👤  You: /foo
+👤  You: /clear
 ❌  Unknown command
 Commands:
   /help    Show this help

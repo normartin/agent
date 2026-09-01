@@ -8,14 +8,14 @@ Ctrl+C stops the turn; its running command goes to background.
 Note: prompt cache retention is requested at 24h for this session.
 Piped stdin (echo "…" | ./agent.kt) runs that one prompt: answer on stdout, log on stderr, then exit.
 
-👤  You: say hello
+👤  You: create a README
 
-🧠  Just echo it
-💻  Bash: echo hello
+🧠  Write it, then confirm
+💻  Bash: echo '# Demo' > README.md && cat README.md
 📥  [Exit Code: 0 after 0s] (1 lines)
 
 
-✅  The command printed hello.
+✅  Created README.md.
 📊  2,000 in (0 cached, 0% hit) / 400 out (0 reasoning) · $0.0091 · session $0.0091 · ctx 1,200 (0%)
 
 👤  You: /exit

@@ -36,10 +36,10 @@ class ConsoleApprovalTest : FunSpec({
         ))
     }
 
-    test("welcome screen") {
+    test("unknown command") {
         MockOpenAi().use { mock ->
             val out = console(workspace, mock) {
-                user("/foo")
+                user("/clear")
                 user("/exit")
             }
             mock.requests.size shouldBe 0 // an unknown /command never reaches the model
@@ -50,9 +50,9 @@ class ConsoleApprovalTest : FunSpec({
     test("user input and tool call") {
         MockOpenAi().use { mock ->
             val out = console(workspace, mock) {
-                user("say hello")
-                model(reasoning("Just echo it"), bash(command = "echo hello"))
-                model(answer("The command printed hello."))
+                user("create a README")
+                model(reasoning("Write it, then confirm"), bash(command = "echo '# Demo' > README.md && cat README.md"))
+                model(answer("Created README.md."))
                 user("/exit")
             }
             verify(out)
@@ -62,11 +62,11 @@ class ConsoleApprovalTest : FunSpec({
     test("background job start and finish") {
         MockOpenAi().use { mock ->
             val out = console(workspace, mock) {
-                user("run it")
+                user("run the build in the background")
                 // sleep 1: the job must outlive the turn (stable ordering) yet finish at a stable "1s".
-                model(reasoning("In the background"), bash(action = "start", command = "sleep 1; echo done"))
-                model(answer("started"))
-                model(answer("saw it")) // replies to the finished-job delivery, not to anything typed
+                model(reasoning("Start it as a job"), bash(action = "start", name = "build", command = "sleep 1; echo ok"))
+                model(answer("Build started; I'll report when it finishes."))
+                model(answer("Build finished (exit 0).")) // replies to the finished-job delivery, not to anything typed
                 awaitRequests(3) // nothing typed meanwhile: the third request is the finished-job delivery
                 user("/exit")
             }

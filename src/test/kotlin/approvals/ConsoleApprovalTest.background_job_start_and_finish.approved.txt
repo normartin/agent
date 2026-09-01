@@ -8,20 +8,20 @@ Ctrl+C stops the turn; its running command goes to background.
 Note: prompt cache retention is requested at 24h for this session.
 Piped stdin (echo "…" | ./agent.kt) runs that one prompt: answer on stdout, log on stderr, then exit.
 
-👤  You: run it
+👤  You: run the build in the background
 
-🧠  In the background
-🚀  Started background job "job1": sleep 1; echo done
+🧠  Start it as a job
+🚀  Started background job "build": sleep 1; echo ok
 
-✅  started
+✅  Build started; I'll report when it finishes.
 📊  2,000 in (0 cached, 0% hit) / 400 out (0 reasoning) · $0.0091 · session $0.0091 · ctx 1,200 (0%)
 
 👤  You:
 🔔  A background job finished.
-🏁  [background job "job1" finished] sleep 1; echo done — [Exit Code: 0 after 1s] (1 lines)
+🏁  [background job "build" finished] sleep 1; echo ok — [Exit Code: 0 after 1s] (1 lines)
 
 
-✅  saw it
+✅  Build finished (exit 0).
 📊  1,000 in (0 cached, 0% hit) / 200 out (0 reasoning) · $0.0046 · session $0.0136 · ctx 1,200 (0%)
 👤  You: /exit
 
