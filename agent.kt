@@ -269,17 +269,7 @@ class BashAgentHarness(
             repeat(MAX_ITERATIONS) {
                 if (interrupted) return stopInterrupted()
                 pumpJobs(announceRunning = false)
-                // Logged after the trim, so chars_after is real; agent-log.kt reads all three keys.
-                val (itemsBefore, charsBefore) = input.size to input.sumOf { it.toString().length }
-                var summary: String? = null
-                trimHistory(input, contextTokens) { dropped -> summarize(dropped).also { summary = it } }
-                if (input.size < itemsBefore) log?.event("trim") {
-                    put("dropped", itemsBefore - input.size)
-                    put("context_tokens", contextTokens)
-                    put("chars_before", charsBefore)
-                    put("chars_after", input.sumOf { it.toString().length })
-                    put("summary", summary)
-                }
+                trimAndLog()
 
                 Spinner.start("Thinking")
                 val turn = runCatching { callOpenAI(httpClient, input, apiKey, baseUrl, { interrupted }, log) }
@@ -326,6 +316,21 @@ class BashAgentHarness(
         }
     }
 
+    /** Trims the history if oversized. Logged after the trim, so chars_after is real; agent-log.kt reads all three keys. */
+    private fun trimAndLog() {
+        val itemsBefore = input.size
+        val charsBefore = input.sumOf { it.toString().length }
+        var summary: String? = null
+        trimHistory(input, contextTokens) { dropped -> summarize(dropped).also { summary = it } }
+        if (input.size < itemsBefore) log?.event("trim") {
+            put("dropped", itemsBefore - input.size)
+            put("context_tokens", contextTokens)
+            put("chars_before", charsBefore)
+            put("chars_after", input.sumOf { it.toString().length })
+            put("summary", summary)
+        }
+    }
+
     /** Runs one function_call and builds its function_call_output. */
     private fun runCall(call: JsonObject): JsonObject? {
         val id = call.str("call_id") ?: return null // not "id": a reply pairs on call_id
@@ -365,10 +370,11 @@ class BashAgentHarness(
         if ((action == "run" || action == "start") && command.isNullOrBlank()) {
             return "Execution Error: '$action' needs a 'command' (got: $rawArgs)"
         }
+        val stdinNote = stdin?.let { " ⇐ stdin: ${it.length} chars" }.orEmpty()
 
         return runCatching { when (action) {
             "run" -> {
-                println("💻  Bash: $command" + (stdin?.let { " ⇐ stdin: ${it.length} chars" } ?: ""))
+                println("💻  Bash: $command$stdinNote")
                 val job = jobs.run(command!!, timeoutSeconds, stdin) { interrupted }
                 if (job.name != "foreground") { // renamed only when Ctrl+C moved it to the background
                     println("📦  Moved to background job \"${job.name}\"")
@@ -387,7 +393,7 @@ class BashAgentHarness(
 
             "start" -> {
                 val job = jobs.start(command!!, name, stdin)
-                println("🚀  Started background job \"${job.name}\": $command" + (stdin?.let { " ⇐ stdin: ${it.length} chars" } ?: ""))
+                println("🚀  Started background job \"${job.name}\": $command$stdinNote")
                 "Started background job \"${job.name}\". Its output will be delivered to you when it finishes."
             }
 
@@ -630,11 +636,12 @@ private fun runConsole(workspace: File, apiKey: String, log: JsonlLog?) {
     val wantLine = Semaphore(0)
     var plan = false // the reader thread reads it only after the main loop releases wantLine
     fun prompt() = if (plan) "\n📋  Plan: " else "\n👤  You: "
+    fun redraw() { reader.callWidget(LineReader.REDRAW_LINE); reader.callWidget(LineReader.REDISPLAY) }
     // Shift-Tab (backtab) flips plan mode mid-line; setPrompt is only on the impl; a diffed redisplay garbles the emoji, so redraw fully.
     reader.keyMaps[LineReader.MAIN]!!.bind(Widget {
         plan = !plan
         (reader as LineReaderImpl).setPrompt(prompt())
-        reader.callWidget(LineReader.REDRAW_LINE); reader.callWidget(LineReader.REDISPLAY)
+        redraw()
         true
     }, KeyMap.key(terminal, InfoCmp.Capability.key_btab), "\u001b[Z")
     thread(isDaemon = true) {
@@ -668,7 +675,7 @@ private fun runConsole(workspace: File, apiKey: String, log: JsonlLog?) {
                 // readLine is still active on the reader thread (it cannot be cancelled), so a turn's output
                 // scrolls its prompt away; redraw is the only cross-thread call JLine allows.
                 harness.resume()
-                runCatching { reader.callWidget(LineReader.REDRAW_LINE); reader.callWidget(LineReader.REDISPLAY) }
+                runCatching { redraw() }
             }
             is Event.Typed -> {
                 prompted = false
