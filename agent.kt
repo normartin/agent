@@ -1,5 +1,5 @@
 ///usr/bin/env jbang "$0" "$@" ; exit $?
-//JAVA 22+
+//JAVA 25+
 //JAVA_OPTIONS --enable-native-access=ALL-UNNAMED
 //KOTLIN 2.4.10
 //DEPS org.jetbrains.kotlin:kotlin-stdlib:2.4.10

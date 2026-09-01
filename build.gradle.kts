@@ -59,9 +59,9 @@ kotlin {
     compilerOptions {
         // Fail the build on any Kotlin warning in main and test compilations.
         allWarningsAsErrors = true
-        // The local JDK is newer than any target Kotlin 2.4 accepts. This sets
+        // The local JDK is new enough for Kotlin/JDK alignment here. This sets
         // the bytecode version only, so sun.misc.Signal stays reachable.
-        jvmTarget = JvmTarget.JVM_22
+        jvmTarget = JvmTarget.JVM_25
     }
 }
 
@@ -69,8 +69,8 @@ java {
     toolchain {
         languageVersion.set(JavaLanguageVersion.of(25))
     }
-    sourceCompatibility = JavaVersion.VERSION_22
-    targetCompatibility = JavaVersion.VERSION_22
+    sourceCompatibility = JavaVersion.VERSION_25
+    targetCompatibility = JavaVersion.VERSION_25
 }
 
 tasks.test {
