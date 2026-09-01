@@ -44,14 +44,15 @@ dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.11.0")
     implementation("org.jline:jline:4.4.0")
 
-    testImplementation("io.kotest:kotest-runner-junit5:6.2.4")
-    testImplementation("io.kotest:kotest-assertions-core:6.2.4")
-    testImplementation("io.kotest:kotest-property:6.2.4")
-    testImplementation("com.approvaltests:approvaltests:31.0.0")
+    testImplementation(group = "io.kotest",           name = "kotest-runner-junit5",  version = "6.2.4")
+    testImplementation(group = "io.kotest",           name = "kotest-assertions-core", version = "6.2.4")
+    testImplementation(group = "io.kotest",           name = "kotest-property",        version = "6.2.4")
+    testImplementation(group = "com.approvaltests",   name = "approvaltests",          version = "31.0.0")
+    testImplementation(group = "ch.qos.logback",      name = "logback-classic",        version = "1.5.18")
     // Headless terminal emulation for the console tests: pty4j spawns the agent
     // on a real pty, jediterm renders its output into a text screen.
-    testImplementation("org.jetbrains.jediterm:jediterm-core:3.74")
-    testImplementation("org.jetbrains.pty4j:pty4j:0.13.12")
+    testImplementation(group = "org.jetbrains.jediterm", name = "jediterm-core",       version = "3.74")
+    testImplementation(group = "org.jetbrains.pty4j", name = "pty4j",                  version = "0.13.12")
 }
 
 kotlin {
