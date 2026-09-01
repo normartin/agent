@@ -42,18 +42,21 @@ class ApiProtocolTest : FunSpec({
             }
         }
 
-        test("declares the one bash tool, flat") {
+        test("declares the bash tool flat, and the built-in web_search") {
             MockOpenAi().use { mock ->
                 mock.script(turn(answer("ok")))
                 mock.call()
-                val tools = mock.requests.single().json["tools"]!!.jsonArray
-                tools.map { it.jsonObject["name"]!!.jsonPrimitive.content } shouldBe listOf("bash")
+                val tools = mock.requests.single().json["tools"]!!.jsonArray.map { it.jsonObject }
+                tools.map { it.str("name") ?: it.str("type") } shouldBe listOf("bash", "web_search")
 
                 // Responses puts name/description/parameters on the tool itself.
                 // The chat-completions "function" wrapper is a 400 here.
-                val tool = tools.single().jsonObject
-                tool["function"] shouldBe null
-                tool["type"]!!.jsonPrimitive.content shouldBe "function"
+                val bash = tools.single { it.str("name") == "bash" }
+                bash["function"] shouldBe null
+                bash["type"]!!.jsonPrimitive.content shouldBe "function"
+
+                // web_search is just a type: the API runs it server-side, nothing to configure.
+                tools.single { it.str("type") == "web_search" }.keys shouldBe setOf("type")
             }
         }
 

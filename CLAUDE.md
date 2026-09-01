@@ -48,6 +48,9 @@ The code should stay short and readable. If new features required signigificantl
 - The bash tool schema is deliberately strict-shaped (`strict: true`, every property in
   `required`, the optional ones nullable). Strict is the Responses default anyway; declaring it
   keeps the logged schema honest and gives the model `null` instead of filler like `"name":""`.
+- `TOOLS` also declares the built-in `web_search`: OpenAI runs it server-side, so its
+  `web_search_call` items are echoed back like reasoning items and never replied to. Its per-call fee
+  (~$10/1k searches) is billed outside `usage`, so the 📊 cost line does not see it.
 - The loop echoes the Responses `output` array back verbatim as the next
   request's `input`, reasoning items included — that is what keeps gpt-5's
   thinking alive across tool calls. It works because `store` is left at its

@@ -104,6 +104,14 @@ fun bashRaw(arguments: String, callId: String = "call_1") = buildJsonObject {
     put("arguments", arguments)
 }
 
+/** A built-in web search the API already ran server-side; the harness must echo it back and not reply to it. */
+fun webSearchCall(query: String, id: String = "ws_1") = buildJsonObject {
+    put("type", "web_search_call")
+    put("id", id)
+    put("status", "completed")
+    putJsonObject("action") { put("type", "search"); put("query", query) }
+}
+
 /** A 200 whose output is [items], with a usage block. */
 fun turn(
     vararg items: JsonObject,

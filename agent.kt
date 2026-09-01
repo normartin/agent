@@ -110,9 +110,8 @@ fun systemPrompt(workspace: File, depth: Int = AGENT_DEPTH, subAgentCommand: Str
     user input: report it and stop; fix it only if it failed. Background jobs survive an interrupted task and die with the session.
 
     Keep command count low: batch related reads, make the smallest correct edit, then run the smallest validation
-    that proves correctness. Prefer grep/sed one-liners over writing a script. Web pages: never print raw HTML;
-    docs sites usually serve markdown at the URL with .md appended (or list pages in /llms.txt), otherwise strip
-    tags (sed 's/<[^>]*>//g') and grep -C for what you need.
+    that proves correctness. Prefer grep/sed one-liners over writing a script. For docs and web lookups use the
+    web_search tool, not curl.
 """.trimIndent() + subAgentPrompt(depth, subAgentCommand) +
     // Instructions last, so the harness text ahead of them is identical in every project.
     projectInstructions(workspace).takeIf { it.isNotBlank() }
@@ -152,8 +151,8 @@ val PLAN_NOTE = "\n\n[plan mode] Read-only: explore with bash (cat, grep, git lo
     "delete files, and do not start background jobs. End with a concrete step-by-step plan (files, edits, " +
     "validation) and stop; the user will approve it and ask you to execute it."
 
-// One tool, six actions, resent every turn. We mark all fields required, so optionals are nullable:
-// that gives the model a legal way to omit a field as null instead of inventing filler.
+// The bash tool plus the built-in web_search (run server-side: its call items need no reply, just the echo).
+// All bash fields are required, optionals nullable: a legal way to omit a field instead of inventing filler.
 val TOOLS = Json.parseToJsonElement("""[{
     "type": "function", "name": "bash", "strict": true,
     "description": "Run a shell command in the workspace (killed after ${TIMEOUT_SECONDS}s), or manage a background job that outlives the turn and is referred to by name.",
@@ -166,7 +165,8 @@ val TOOLS = Json.parseToJsonElement("""[{
             "stdin":   { "type": ["string", "null"], "description": "run and start: text fed to the command's standard input — put multi-line scripts here (command \"python3 -\" or \"bash -s\") or exact file content (command \"cat > path\"). Null otherwise." },
             "name":    { "type": ["string", "null"], "description": "Job name for stop, output and wait; optional on start; null for run and list." },
             "seconds": { "type": ["number", "null"], "description": "wait only: how long it may block (default $DEFAULT_WAIT_SECONDS, max $MAX_WAIT_SECONDS). Null otherwise." }
-        } } }]""").jsonArray
+        } } },
+    { "type": "web_search" }]""").jsonArray
 
 // ---------- 2. Agent loop ----------
 
@@ -298,6 +298,8 @@ class BashAgentHarness(
                 turn.output.forEach { input.add(it.jsonObject) }
 
                 reasoningSummary(turn.output)?.let { println("🧠  $it") }
+                turn.output.map { it.jsonObject }.filter { it.str("type") == "web_search_call" }
+                    .forEach { println("🔍  " + (it.obj("action")?.str("query") ?: "web search")) }
                 val text = assistantText(turn.output)
                 val calls = turn.output.map { it.jsonObject }.filter { it.str("type") == "function_call" }
                 if (calls.isEmpty()) {
