@@ -59,6 +59,14 @@ class ForegroundRunTest : FunSpec({
         collapseCarriageReturns("plain\nlines\n") shouldBe "plain\nlines\n"
     }
 
+    test("the console summary carries the status line and the exact line count") {
+        val job = JobRegistry(workspace).run("echo one; echo two", 30) { false }
+
+        job.lineCount() shouldBe 2
+        job.summary() shouldBe "[Exit Code: 0 after ${job.elapsedSeconds}s] (2 lines)"
+        job.summary("[Killed]") shouldBe "[Killed] (2 lines)"
+    }
+
     test("a foreground command runs in the workspace") {
         JobRegistry(workspace).run("pwd", 30) { false }
             .report() shouldContain workspace.canonicalPath

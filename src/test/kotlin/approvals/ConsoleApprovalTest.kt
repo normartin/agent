@@ -55,4 +55,21 @@ class ConsoleApprovalTest : FunSpec({
             verify(out)
         }
     }
+
+    test("background job start and finish") {
+        MockOpenAi().use { mock ->
+            mock.script(
+                // sleep 1: the job must outlive the turn (stable ordering) yet finish at a stable "1s".
+                turn(reasoning("In the background"), bash(action = "start", command = "sleep 1; echo done")),
+                turn(answer("started")),
+                turn(answer("saw it"))
+            )
+            val out = console(workspace, mock) {
+                line("run it")
+                awaitRequests(3) // nothing typed meanwhile: the third request is the finished-job delivery
+                line("/exit")
+            }
+            verify(out)
+        }
+    }
 })

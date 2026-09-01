@@ -67,7 +67,7 @@ const val MAX_INSTRUCTIONS_CHARS = 20_000
 // Sized against TPM, not the context window: the whole history is resent every iteration.
 const val MAX_OUTPUT_CHARS = 12_000
 const val MAX_HISTORY_TOKENS = 30_000
-/** Console echo only; the model and the log always get the whole result. */
+/** Live tail under the spinner only; the model and the log always get the whole result. */
 const val SHOWN_OUTPUT_LINES = 5
 // Trimming forfeits the prompt cache behind the cut, so cut deep and rarely.
 const val TRIM_TARGET_TOKENS = MAX_HISTORY_TOKENS * 6 / 10
@@ -338,7 +338,8 @@ class BashAgentHarness(
             call.str("name") != "bash" -> "Execution Error: there is no tool named '${call.str("name")}'."
             else -> runBashCall(args, rawArgs)
         }
-        println("📥  Output:\n${tailForConsole(result)}\n")
+        // Job branches echo their own summary; errors are one-liners worth showing whole.
+        if (result.startsWith("Execution Error") || result.startsWith("[Skipped")) println("📥  $result\n")
         log?.event("tool_result") {
             put("call_id", id)
             put("output", result)
@@ -373,6 +374,7 @@ class BashAgentHarness(
                         interrupted -> "[Interrupted by the user — process killed]"
                         else -> "[TIMED OUT after ${timeoutSeconds}s — process killed. Output above is partial.]"
                     }
+                    println("📥  ${job.summary(note)}\n")
                     job.report(note)
                 }
             }
@@ -387,20 +389,23 @@ class BashAgentHarness(
                 job.stop()
                 job.await(2)
                 job.reported = true // so pumpJobs does not repeat it
-                println("🛑  Stopped background job \"${job.name}\"")
+                println("🛑  Stopped background job \"${job.name}\" — ${job.summary()}\n")
                 "Stopped background job \"${job.name}\".\n${job.report()}"
             }
 
             "list" -> {
                 val known = jobs.all()
-                if (known.isEmpty()) "No background jobs."
+                val listing = if (known.isEmpty()) "No background jobs."
                 else known.joinToString(prefix = "[background jobs]\n", separator = "\n") {
                     "- \"${it.name}\" (${it.state.name.lowercase()}, ${it.elapsedSeconds}s): ${it.command}"
                 }
+                println("📥  $listing\n")
+                listing
             }
 
             "output" -> withJob(name) { job ->
                 if (job.done) job.reported = true
+                println("📥  ${job.summary()}\n")
                 job.report()
             }
 
@@ -409,6 +414,7 @@ class BashAgentHarness(
                     .coerceIn(1, MAX_WAIT_SECONDS)
                 println("⏳ Waiting up to ${seconds}s for background job \"${job.name}\"…")
                 if (job.await(seconds) { interrupted }) job.reported = true
+                println("📥  ${job.summary()}\n")
                 job.report()
             }
 
@@ -425,12 +431,15 @@ class BashAgentHarness(
 
     /** Delivers finished jobs and, at a user turn, what still runs. As messages, never in item 0: the cache keys on it. */
     private fun pumpJobs(announceRunning: Boolean) {
-        fun notice(text: String, icon: String = "") {
-            println("$icon$text\n")
+        fun notice(text: String, icon: String = "", display: String = text) {
+            println("$icon$display\n")
             log?.event("job_notice") { put("text", text) }
             input.add(message("user", text))
         }
-        jobs.drainFinished().forEach { notice("[background job \"${it.name}\" finished] ${it.command}\n${it.report()}", "🏁  ") }
+        jobs.drainFinished().forEach {
+            val head = "[background job \"${it.name}\" finished] ${it.command}"
+            notice("$head\n${it.report()}", "🏁  ", display = "$head — ${it.summary()}")
+        }
         val live = if (announceRunning) jobs.running() else return
         if (live.isNotEmpty()) notice(live.joinToString("\n", prefix = "[background jobs still running]\n") {
             "- \"${it.name}\" (${it.elapsedSeconds}s): ${it.command}"
@@ -692,13 +701,6 @@ fun availableTools(names: List<String> = listOf("rg", "jq", "python3", "curl", "
 fun instructionsNotice(workspace: File): String? =
     instructionFiles(workspace).takeIf { it.isNotEmpty() }?.let { "📄  Instructions: " + it.joinToString(", ") { f -> f.name } }
 
-/** Last few lines for the console, indented so output stands apart from the prompt. */
-fun tailForConsole(text: String, keep: Int = SHOWN_OUTPUT_LINES): String {
-    val lines = text.lines()
-    val shown = if (lines.size <= keep) lines else listOf("[${lines.size - keep} lines hidden]") + lines.takeLast(keep)
-    return shown.joinToString("\n") { "   $it" }
-}
-
 /** Last [keep] lines of a growing log, reading only its end: cheap enough to poll while a job runs. */
 fun tailLines(file: File, keep: Int = SHOWN_OUTPUT_LINES, window: Int = 8192): List<String> {
     val from = maxOf(0L, file.length() - window)
@@ -839,14 +841,19 @@ class BackgroundJob(
         // At read time: a \r frame can straddle two writes.
         val output = collapseCarriageReturns(readTruncated(logFile))
         if (output.isNotBlank()) append(output)
-        append(
-            note ?: when (state) {
-                JobState.RUNNING -> "[Still running after ${elapsedSeconds}s]"
-                JobState.KILLED -> "[Killed after ${elapsedSeconds}s]"
-                JobState.EXITED -> "[Exit Code: ${exitCode ?: "unknown"} after ${elapsedSeconds}s]"
-            }
-        )
+        append(status(note))
     }
+
+    private fun status(note: String?) = note ?: when (state) {
+        JobState.RUNNING -> "[Still running after ${elapsedSeconds}s]"
+        JobState.KILLED -> "[Killed after ${elapsedSeconds}s]"
+        JobState.EXITED -> "[Exit Code: ${exitCode ?: "unknown"} after ${elapsedSeconds}s]"
+    }
+
+    fun lineCount() = logFile.useLines { it.count() }
+
+    /** Console one-liner; the model and the log always get the whole result. */
+    fun summary(note: String? = null) = "${status(note)} (${lineCount()} lines)"
 }
 
 /** Runs every command; only background jobs are registered by name, and stay findable when done. */
